@@ -1,0 +1,10 @@
+flask
+flask-socketio
+eventlet
+flask-cors
+numpy
+opencv-python
+torch
+mediapipe
+pygame
+PyOpenGL

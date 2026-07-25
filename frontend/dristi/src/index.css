@@ -1,3 +1,27 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+
+@theme {
+  --color-background: var(--bg-color);
+  --color-accent: var(--accent-color);
+}
+
+:root {
+  --bg-color: #F9F8F6;
+  --accent-color: #C9B59C;
+  --text-color: #1a1a1a;
+}
+
+.dark {
+  --bg-color: #091413;
+  --accent-color: #B0E4CC;
+  --text-color: #f1f1f1;
+}
+
+body {
+  background-color: var(--bg-color);
+  color: var(--text-color);
+  transition: background-color 0.3s ease, color 0.3s ease;
+  min-height: 100vh;
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+}

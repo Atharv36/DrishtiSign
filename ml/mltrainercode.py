@@ -16,8 +16,11 @@ import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 
-# ── CONFIG ────────────────────────────────────────────────────
-DATASET_PATH  = "/Users/dikshitbhusal/.cache/kagglehub/datasets/grassknoted/asl-alphabet/versions/1/asl_alphabet_train/asl_alphabet_train"
+import kagglehub
+
+print("⏳ Downloading/Locating Kaggle Dataset automatically...")
+base_path = kagglehub.dataset_download("grassknoted/asl-alphabet")
+DATASET_PATH  = os.path.join(base_path, "asl_alphabet_train", "asl_alphabet_train")
 EXPORT_DIR    = "exported_model"
 EPOCHS        = 50          # more epochs for better accuracy
 BATCH_SIZE    = 64
