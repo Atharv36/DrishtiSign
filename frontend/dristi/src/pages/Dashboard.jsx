@@ -6,12 +6,14 @@ import ActivityCalendar from '../components/ActivityCalendar';
 const SignLearningMode = lazy(() => import('../components/SignLearningMode'));
 const SignPracticeMode = lazy(() => import('../components/SignPracticeMode'));
 const SignToText = lazy(() => import('../components/SignToText'));
+const TextToSign = lazy(() => import('../components/TextToSign'));
 
 const Dashboard = () => {
   const navigate = useNavigate();
   const [isSignModeOpen, setIsSignModeOpen] = useState(false);
   const [isPracticeModeOpen, setIsPracticeModeOpen] = useState(false);
   const [isSignToTextOpen, setIsSignToTextOpen] = useState(false);
+  const [isTextToSignOpen, setIsTextToSignOpen] = useState(false);
   const [userName, setUserName] = useState('');
 
   useEffect(() => {
@@ -129,40 +131,35 @@ const Dashboard = () => {
                 </div>
             </div>
 
-            {/* 3. Text → Sign  COMING SOON */}
+            {/* 3. Text → Sign  ACTIVE */}
             <div className="col-span-1 lg:col-span-2">
-                 <div className="h-full bg-gray-50/80 dark:bg-black/60 border border-gray-200 dark:border-gray-800 rounded-3xl p-8 opacity-80 cursor-not-allowed">
-                     
-                     <div className="inline-flex items-center gap-2 px-3 py-1 bg-gray-200 dark:bg-gray-800 text-gray-500 dark:text-gray-400 rounded-full text-xs font-bold uppercase tracking-wider mb-6">
-                         Coming Soon
+                 <div className="h-full bg-white dark:bg-[#0f172a] border border-teal-400/40 rounded-3xl p-8 shadow-xl flex flex-col md:flex-row justify-between items-center gap-8">
+
+                    <div className="w-full md:w-2/3">
+                        <div className="inline-flex items-center gap-2 px-3 py-1 bg-teal-500/10 text-teal-500 dark:text-teal-300 rounded-full text-xs font-bold uppercase tracking-wider mb-4 border border-teal-500/20">
+                            <span className="w-2 h-2 rounded-full bg-teal-400 animate-pulse"></span>
+                            Active Feature
+                        </div>
+
+                        <h3 className="text-3xl font-bold mb-3 text-[var(--text-color)]">Text → Sign</h3>
+                        <p className="text-sm text-gray-500 dark:text-gray-400 mb-6 max-w-lg">
+                            Type a sentence and our 3D avatar signs it back — using whole-word signs where it knows them, fingerspelling everything else.
+                        </p>
+
+                        <button
+                            onClick={() => setIsTextToSignOpen(true)}
+                            className="bg-[var(--text-color)] text-[var(--bg-color)] px-6 py-3.5 rounded-xl font-bold tracking-wide hover:opacity-90 transition-all flex items-center gap-2 w-fit"
+                        >
+                            Start Translating
+                            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M14 5l7 7m0 0l-7 7m7-7H3"></path></svg>
+                        </button>
                     </div>
 
-                    <h3 className="text-2xl font-bold mb-3 text-[var(--text-color)]">Text → Sign</h3>
-                    <p className="text-sm text-gray-500 dark:text-gray-400 mb-6">
-                        Type out sentences or import documents to watch our 3D Avatar sequentially sign your text.
-                    </p>
-
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pointer-events-none opacity-50">
-                         {/* Disabled Input */}
-                         <div className="w-full">
-                            <label className="text-xs font-medium text-gray-500 uppercase tracking-widest mb-1 block">Input Text</label>
-                            <div className="w-full h-32 bg-white dark:bg-[#0f172a] rounded-xl border border-gray-300 dark:border-gray-700 p-4 shadow-inner">
-                                <span className="text-gray-400">Type something...</span>
-                            </div>
-                         </div>
-
-                         {/* Sequential Avatar output skeleton */}
-                         <div className="w-full flex gap-2">
-                             <div className="flex-1 bg-gray-200 dark:bg-gray-800 rounded-xl h-32 flex items-end p-2 border border-gray-300 dark:border-gray-700 relative overflow-hidden">
-                                  <div className="absolute -bottom-4 -right-4 w-16 h-16 rounded-full bg-indigo-500/20"></div>
-                             </div>
-                             <div className="w-12 flex items-center justify-center">
-                                 <svg className="w-6 h-6 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M14 5l7 7m0 0l-7 7m7-7H3"></path></svg>
-                             </div>
-                             <div className="flex-1 bg-gray-200 dark:bg-gray-800 rounded-xl h-32 flex items-end p-2 border border-gray-300 dark:border-gray-700 relative overflow-hidden">
-                                  <div className="absolute -bottom-4 -left-4 w-16 h-16 rounded-full bg-teal-500/20"></div>
-                             </div>
-                         </div>
+                    <div className="w-full md:w-1/3 flex justify-center md:justify-end">
+                        <div className="w-40 h-40 bg-gray-100 dark:bg-gray-800 rounded-full border-8 border-white dark:border-black shadow-2xl flex items-center justify-center overflow-hidden relative">
+                             <div className="absolute inset-0 bg-teal-400 opacity-20"></div>
+                             <svg className="w-16 h-16 text-teal-400 relative z-10" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                        </div>
                     </div>
 
                  </div>
@@ -213,6 +210,20 @@ const Dashboard = () => {
             </div>
         }>
           <SignToText close={() => setIsSignToTextOpen(false)} />
+        </Suspense>
+      )}
+
+      {/* Lazy Load Text to Sign Feature */}
+      {isTextToSignOpen && (
+        <Suspense fallback={
+            <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50">
+                <div className="bg-white dark:bg-[#0f172a] p-8 rounded-3xl flex flex-col justify-center items-center">
+                     <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-[var(--accent-color)] mb-4"></div>
+                     <p className="font-medium animate-pulse">Initializing Interface...</p>
+                </div>
+            </div>
+        }>
+          <TextToSign close={() => setIsTextToSignOpen(false)} />
         </Suspense>
       )}
 

@@ -1,7 +1,7 @@
 import eventlet
 eventlet.monkey_patch()
 
-import os, json, glob, numpy as np, cv2, torch, torch.nn as nn
+import os, json, glob, time, signal, numpy as np, cv2, torch, torch.nn as nn
 import base64
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
@@ -13,9 +13,29 @@ from flask_cors import CORS
 
 from Hand_avatar import HandAvatar3D
 from feature_utils import features_for_dim, BASIC_DIM
+from text_to_sign import translate as translate_text_to_sign
 
-# Ensure headless PyOpenGL
-os.environ["SDL_VIDEODRIVER"] = "dummy"
+# Creating a real (even off-screen) SDL/OpenGL window turns this process into
+# a full macOS Cocoa app under the hood, which then ignores plain SIGTERM/
+# SIGINT in favor of its own Apple Event quit protocol - Ctrl+C or a normal
+# `kill` silently does nothing, and the window shows as "not responding."
+# Installing explicit handlers that call os._exit() forces an immediate,
+# unconditional process exit that bypasses that entirely.
+def _force_exit(signum, frame):
+    print(f"\nReceived signal {signum}, shutting down...")
+    os._exit(0)
+
+signal.signal(signal.SIGINT, _force_exit)
+signal.signal(signal.SIGTERM, _force_exit)
+
+# NOTE: this used to force SDL_VIDEODRIVER=dummy to try to run "headless" -
+# but the dummy driver has no real rendering backend at all, so it made
+# every OpenGL context creation in Hand_avatar.py silently fail (caught by
+# the broad try/except in init_globals() below), leaving `avatar = None`
+# for the entire app's lifetime. The 3D hand avatar has never actually
+# rendered as a result. Letting pygame use the real (Cocoa) driver fixes
+# this; the window it opens is borderless (NOFRAME, see Hand_avatar.py)
+# and only its rendered pixels are read back and streamed to the browser.
 
 # ── CONFIG ────────────────────────────────────────────────────
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
@@ -171,6 +191,14 @@ class TextSession:
 # share a sentence buffer.
 text_sessions = {}
 
+# Per-connection Text->Sign playback state, keyed by socket id. Each entry
+# is {'stop': bool} - a background task checks this flag every frame so a
+# new translation (or a disconnect) can cancel a running sequence.
+sign_sessions = {}
+
+TEXT_TO_SIGN_HOLD_SECONDS = 1.3   # how long each sign stays on screen
+TEXT_TO_SIGN_FRAME_INTERVAL = 0.08  # ~12fps pushed to the client
+
 # Setup Flask server
 app = Flask(__name__)
 CORS(app)
@@ -199,7 +227,23 @@ def init_globals():
     except Exception as e:
         print("Failed to initialize Mediapipe/Avatar:", e)
 
+def pump_avatar_events():
+    """Keep the avatar's (off-screen) window event queue alive for the whole
+    process lifetime, not just while frames are being drawn - see
+    HandAvatar3D.pump_events(). Without this, macOS considers the window
+    unresponsive once nothing has rendered for a while and it can't be
+    quit normally."""
+    while True:
+        if avatar is not None:
+            try:
+                avatar.pump_events()
+            except Exception:
+                pass
+        socketio.sleep(0.2)
+
 init_globals()
+if avatar is not None:
+    socketio.start_background_task(pump_avatar_events)
 
 @app.route('/')
 def index():
@@ -226,6 +270,9 @@ def test_connect():
 def test_disconnect():
     print('Client disconnected')
     text_sessions.pop(request.sid, None)
+    session = sign_sessions.pop(request.sid, None)
+    if session:
+        session['stop'] = True
 
 @socketio.on('video_frame')
 def handle_video_frame(data):
@@ -439,6 +486,102 @@ def handle_text_key(data):
         session.sentence = ''
 
     emit('text_processed_frame', {'sentence': session.sentence})
+
+# ── TEXT -> SIGN (typed sentence -> avatar plays the signs) ──────
+# Unlike video_frame/text_frame, there's no incoming camera stream driving
+# the pace here, so the server itself pushes frames on a timer via a
+# background greenlet - the standard eventlet pattern for server-initiated
+# streaming. It reuses the single global `avatar` (see init_globals): a
+# second HandAvatar3D would fight over pygame's one display surface, so if
+# Text->Sign and live detection run in two tabs at once they'll visibly
+# interrupt each other - an accepted limitation, same class as the other
+# global detection state in this file.
+MAX_SIGN_QUEUE = 60  # ~1.5 min of playback at TEXT_TO_SIGN_HOLD_SECONDS each
+
+@socketio.on('translate_text')
+def handle_translate_text(data):
+    sid = request.sid
+    text = (data or {}).get('text', '').strip()
+    use_llm = bool((data or {}).get('useLLM', False))
+
+    # A new translation cancels whatever this client was already playing.
+    old = sign_sessions.get(sid)
+    if old:
+        old['stop'] = True
+
+    if not text:
+        emit('sign_translate_error', {'message': 'Please enter some text.'})
+        return
+    if len(text) > 300:
+        emit('sign_translate_error', {'message': 'That sentence is too long — please shorten it.'})
+        return
+
+    result = translate_text_to_sign(text, use_llm=use_llm)
+    queue = result['queue'][:MAX_SIGN_QUEUE]
+
+    if not queue:
+        emit('sign_translate_error', {
+            'message': "Couldn't find any signable words in that sentence.",
+            'simplified': result['simplified'],
+            'gloss': result['gloss'],
+        })
+        return
+
+    session = {'stop': False}
+    sign_sessions[sid] = session
+
+    emit('sign_translate_started', {
+        'simplified': result['simplified'],
+        'gloss': result['gloss'],
+        'queue': queue,
+    })
+
+    socketio.start_background_task(play_sign_queue, sid, queue, session)
+
+
+def play_sign_queue(sid, queue, session):
+    if avatar is None:
+        socketio.emit('sign_translate_error', {
+            'message': 'The 3D avatar failed to initialize on the server.'
+        }, room=sid)
+        return
+
+    for idx, unit in enumerate(queue):
+        if session.get('stop'):
+            return
+
+        avatar.load_gesture(unit['label'])
+        hold_until = time.time() + TEXT_TO_SIGN_HOLD_SECONDS
+
+        while time.time() < hold_until:
+            if session.get('stop'):
+                return
+
+            canvas = np.zeros((400, 400, 3), dtype=np.uint8)
+            avatar.draw(canvas)
+            _, buffer = cv2.imencode('.jpg', canvas, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            out_b64 = base64.b64encode(buffer).decode('utf-8')
+
+            socketio.emit('sign_processed_frame', {
+                'image': f"data:image/jpeg;base64,{out_b64}",
+                'index': idx,
+                'total': len(queue),
+                'label': unit['label'],
+                'word': unit['word'],
+                'kind': unit['kind'],
+            }, room=sid)
+
+            socketio.sleep(TEXT_TO_SIGN_FRAME_INTERVAL)
+
+    if not session.get('stop'):
+        socketio.emit('sign_sequence_done', {}, room=sid)
+
+
+@socketio.on('stop_sign_sequence')
+def handle_stop_sign_sequence():
+    session = sign_sessions.get(request.sid)
+    if session:
+        session['stop'] = True
 
 if __name__ == '__main__':
     print("Starting DrishtiSign ML Socket Server on port 5002...")
