@@ -83,3 +83,7 @@ htmlcov/
 dist/
 build/
 *.egg-info/
+# Word-model data artifacts (large, regenerable)
+word_clips/
+wlasl_samples.json
+word_sequences_cache.npz
