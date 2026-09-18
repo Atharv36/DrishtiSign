@@ -1,12 +1,17 @@
 import React, { useState, useEffect, Suspense, lazy } from 'react';
 import { useNavigate } from 'react-router-dom';
+import ActivityCalendar from '../components/ActivityCalendar';
 
 // Lazy load the heavy ML/Camera module
 const SignLearningMode = lazy(() => import('../components/SignLearningMode'));
+const SignPracticeMode = lazy(() => import('../components/SignPracticeMode'));
+const SignToText = lazy(() => import('../components/SignToText'));
 
 const Dashboard = () => {
   const navigate = useNavigate();
   const [isSignModeOpen, setIsSignModeOpen] = useState(false);
+  const [isPracticeModeOpen, setIsPracticeModeOpen] = useState(false);
+  const [isSignToTextOpen, setIsSignToTextOpen] = useState(false);
   const [userName, setUserName] = useState('');
 
   useEffect(() => {
@@ -44,7 +49,13 @@ const Dashboard = () => {
         </div>
 
         {/* 3 Explicit Feature Modules Grid */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">{/* Activity Calendar */}
+        <div className="mt-8">
+            <h2 className="text-2xl font-bold mb-4 text-[var(--text-color)]">Your Activity</h2>
+            <div className="max-w-md">
+                <ActivityCalendar />
+            </div>
+        </div>
 
             {/* 1. Sign Learning (Flashcard Mode) ACTIVE */}
             <div className="col-span-1 lg:col-span-3 group relative">
@@ -62,13 +73,22 @@ const Dashboard = () => {
                             Master sign language using our real-time AI accuracy model. Follow the 3D hand demonstrations and test your skills efficiently with zero lag.
                         </p>
                         
-                        <button 
-                            onClick={() => setIsSignModeOpen(true)}
-                            className="bg-[var(--text-color)] text-[var(--bg-color)] px-8 py-4 rounded-xl font-bold tracking-wide hover:opacity-90 transition-all flex items-center gap-3 transform hover:-translate-y-1 shadow-lg"
-                        >
-                            Open Flashcards
-                            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M14 5l7 7m0 0l-7 7m7-7H3"></path></svg>
-                        </button>
+                        <div className="flex flex-wrap gap-3">
+                            <button
+                                onClick={() => setIsSignModeOpen(true)}
+                                className="bg-[var(--text-color)] text-[var(--bg-color)] px-8 py-4 rounded-xl font-bold tracking-wide hover:opacity-90 transition-all flex items-center gap-3 transform hover:-translate-y-1 shadow-lg"
+                            >
+                                Start Learning
+                                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M14 5l7 7m0 0l-7 7m7-7H3"></path></svg>
+                            </button>
+                            <button
+                                onClick={() => setIsPracticeModeOpen(true)}
+                                className="bg-transparent border-2 border-[var(--text-color)] text-[var(--text-color)] px-8 py-4 rounded-xl font-bold tracking-wide hover:bg-[var(--text-color)] hover:text-[var(--bg-color)] transition-all flex items-center gap-3 transform hover:-translate-y-1"
+                            >
+                                Start Practice
+                                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+                            </button>
+                        </div>
                     </div>
 
                     {/* Visual Graphic Placeholder for Active module */}
@@ -82,28 +102,28 @@ const Dashboard = () => {
                 </div>
             </div>
 
-            {/* 2. Sign → Text  COMING SOON */}
+            {/* 2. Sign → Text  ACTIVE */}
             <div className="col-span-1 lg:col-span-1">
-                <div className="h-full bg-gray-50/80 dark:bg-black/60 border border-gray-200 dark:border-gray-800 rounded-3xl p-8 opacity-80 cursor-not-allowed">
-                    
-                    <div className="inline-flex items-center gap-2 px-3 py-1 bg-gray-200 dark:bg-gray-800 text-gray-500 dark:text-gray-400 rounded-full text-xs font-bold uppercase tracking-wider mb-6">
-                         Coming Soon
+                <div className="h-full bg-white dark:bg-[#0f172a] border border-indigo-400/40 rounded-3xl p-8 shadow-xl flex flex-col">
+
+                    <div className="inline-flex items-center gap-2 px-3 py-1 bg-indigo-500/10 text-indigo-500 dark:text-indigo-300 rounded-full text-xs font-bold uppercase tracking-wider mb-6 border border-indigo-500/20 w-fit">
+                        <span className="w-2 h-2 rounded-full bg-indigo-400 animate-pulse"></span>
+                        Active Feature
                     </div>
 
                     <h3 className="text-2xl font-bold mb-3 text-[var(--text-color)]">Sign → Text</h3>
                     <p className="text-sm text-gray-500 dark:text-gray-400 mb-6">
-                        Continuous gesture-to-sentence translation. Stream your signs and instantly receive natural text outputs.
+                        Continuous gesture-to-sentence translation. Hold a letter to spell it, use Space/Backspace to punctuate.
                     </p>
 
-                    <div className="space-y-4 pointer-events-none opacity-50">
-                        {/* Fake Webcam Preview */}
-                        <div className="w-full h-32 bg-gray-200 dark:bg-gray-800 rounded-xl flex items-center justify-center border border-gray-300 dark:border-gray-700">
-                            <svg className="w-8 h-8 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z"></path></svg>
-                        </div>
-                        {/* Fake Text Output */}
-                        <div className="w-full h-20 bg-gray-100 dark:bg-gray-900 rounded-xl p-3 border border-gray-200 dark:border-gray-800 flex items-start gap-2">
-                             <div className="w-2 h-4 bg-gray-300 dark:bg-gray-700 animate-pulse mt-1"></div>
-                        </div>
+                    <div className="mt-auto">
+                        <button
+                            onClick={() => setIsSignToTextOpen(true)}
+                            className="w-full bg-[var(--text-color)] text-[var(--bg-color)] px-6 py-3.5 rounded-xl font-bold tracking-wide hover:opacity-90 transition-all flex items-center justify-center gap-2"
+                        >
+                            Start Translating
+                            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M14 5l7 7m0 0l-7 7m7-7H3"></path></svg>
+                        </button>
                     </div>
 
                 </div>
@@ -150,6 +170,8 @@ const Dashboard = () => {
 
         </div>
 
+        
+
       </div>
 
       {/* Lazy Load Sign Learning Feature */}
@@ -163,6 +185,34 @@ const Dashboard = () => {
             </div>
         }>
           <SignLearningMode close={() => setIsSignModeOpen(false)} />
+        </Suspense>
+      )}
+
+      {/* Lazy Load Sign Practice Feature */}
+      {isPracticeModeOpen && (
+        <Suspense fallback={
+            <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50">
+                <div className="bg-white dark:bg-[#0f172a] p-8 rounded-3xl flex flex-col justify-center items-center">
+                     <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-[var(--accent-color)] mb-4"></div>
+                     <p className="font-medium animate-pulse">Initializing Interface...</p>
+                </div>
+            </div>
+        }>
+          <SignPracticeMode close={() => setIsPracticeModeOpen(false)} />
+        </Suspense>
+      )}
+
+      {/* Lazy Load Sign to Text Feature */}
+      {isSignToTextOpen && (
+        <Suspense fallback={
+            <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50">
+                <div className="bg-white dark:bg-[#0f172a] p-8 rounded-3xl flex flex-col justify-center items-center">
+                     <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-[var(--accent-color)] mb-4"></div>
+                     <p className="font-medium animate-pulse">Initializing Interface...</p>
+                </div>
+            </div>
+        }>
+          <SignToText close={() => setIsSignToTextOpen(false)} />
         </Suspense>
       )}
 

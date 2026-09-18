@@ -11,9 +11,16 @@ api.interceptors.request.use(
       const { token } = JSON.parse(userInfo);
       config.headers.Authorization = `Bearer ${token}`;
     }
+    // Let the backend record activity against the user's own local day, not the server's.
+    config.headers['X-Client-Date'] = new Date().toLocaleDateString('en-CA');
     return config;
   },
   (error) => Promise.reject(error)
 );
+
+export const getActivity = async () => {
+  const { data } = await api.get('/activity');
+  return data.data;
+};
 
 export default api;
