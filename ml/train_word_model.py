@@ -28,7 +28,7 @@ Run:  python train_word_model.py
 import json
 import os
 import glob
-from collections import Counter
+from collections import Counter, defaultdict
 
 import numpy as np
 import torch
@@ -52,6 +52,7 @@ EPOCHS        = 120
 BATCH_SIZE    = 16
 LEARNING_RATE = 1e-3
 VAL_SPLIT     = 0.15
+TEST_SPLIT    = 0.15
 EARLY_STOP    = 20
 
 # ── model ─────────────────────────────────────────────────────
@@ -173,13 +174,22 @@ def main():
     if min(counts.values()) < 3:
         print("\n! Some words have <3 clips. Aim for 10+ per word for a usable model.")
 
+    # Three-way split. The test set is held back and never used for training
+    # OR for choosing the best checkpoint - because the val set IS used for
+    # model selection, val accuracy is an optimistic estimate. The test number
+    # is the one to quote in a report.
     idx = np.random.RandomState(42).permutation(len(X))
     n_val = max(1, int(VAL_SPLIT * len(X)))
-    val_idx, train_idx = idx[:n_val], idx[n_val:]
+    n_test = max(1, int(TEST_SPLIT * len(X)))
+    val_idx = idx[:n_val]
+    test_idx = idx[n_val:n_val + n_test]
+    train_idx = idx[n_val + n_test:]
 
     train_dl = DataLoader(SeqDataset(X[train_idx], y[train_idx], augment=True),
                           batch_size=BATCH_SIZE, shuffle=True)
     val_dl = DataLoader(SeqDataset(X[val_idx], y[val_idx]), batch_size=BATCH_SIZE)
+    test_dl = DataLoader(SeqDataset(X[test_idx], y[test_idx]), batch_size=BATCH_SIZE)
+    print(f"Split - train:{len(train_idx)}  val:{len(val_idx)}  test:{len(test_idx)}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = WordSignGRU(len(labels)).to(device)
@@ -238,7 +248,54 @@ def main():
             print(f"\nNo improvement for {EARLY_STOP} epochs - stopping.")
             break
 
-    print(f"\nBest val accuracy: {best:.1%}")
+    print(f"\nBest val accuracy: {best:.1%}  (used for model selection - optimistic)")
+
+    # ── honest evaluation on the held-out test set ────────────
+    model.load_state_dict(torch.load(os.path.join(EXPORT_DIR, "word_model.pth"),
+                                     map_location=device))
+    model.eval()
+
+    preds, actual = [], []
+    with torch.no_grad():
+        for xb, yb in test_dl:
+            preds += model(xb.to(device)).argmax(1).cpu().tolist()
+            actual += yb.tolist()
+
+    if preds:
+        test_acc = sum(p == a for p, a in zip(preds, actual)) / len(preds)
+        print(f"TEST accuracy:     {test_acc:.1%}  <- quote this one\n")
+
+        # Per-word accuracy, worst first - this is your recording to-do list.
+        per_word = defaultdict(lambda: [0, 0])
+        for p, a in zip(preds, actual):
+            per_word[a][1] += 1
+            if p == a:
+                per_word[a][0] += 1
+
+        print("Per-word accuracy (worst first - record more clips for these):")
+        rows = sorted(((labels[c], ok, n) for c, (ok, n) in per_word.items()),
+                      key=lambda r: (r[1] / r[2], -r[2]))
+        for word, ok, n in rows:
+            bar = "#" * int(10 * ok / n)
+            print(f"  {word:12s} {ok}/{n:<3d} {bar}")
+
+        # Confusion pairs: which signs the model actually mixes up.
+        confusions = Counter((labels[a], labels[p])
+                             for p, a in zip(preds, actual) if p != a)
+        if confusions:
+            print("\nMost common confusions (true -> predicted):")
+            for (t, p), n in confusions.most_common(8):
+                print(f"  {t:12s} -> {p:12s} x{n}")
+
+        json.dump({"test_accuracy": test_acc,
+                   "best_val_accuracy": best,
+                   "per_word": {labels[c]: {"correct": ok, "total": n}
+                                for c, (ok, n) in per_word.items()},
+                   "confusions": [{"true": t, "predicted": p, "count": n}
+                                  for (t, p), n in confusions.most_common()]},
+                  open(os.path.join(EXPORT_DIR, "word_eval.json"), "w"), indent=2)
+        print(f"\nFull results -> {EXPORT_DIR}/word_eval.json")
+
     print(f"Saved -> {EXPORT_DIR}/word_model.pth, word_labels.json, word_config.json")
 
 

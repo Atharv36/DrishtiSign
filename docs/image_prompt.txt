@@ -1,0 +1,36 @@
+A photorealistic close-up photograph of a single human right hand performing
+the American Sign Language (ASL) sign for "Hello".
+
+HAND POSITION (follow this exactly — this is the most important part):
+Flat hand, fingers extended and together, thumb alongside. Held at the side of the forehead near the temple, then moving outward and away from the head in an arc, like a relaxed salute.
+ANATOMY REQUIREMENTS:
+- Exactly five fingers, anatomically correct, clearly separated and countable
+- Natural proportions, realistic knuckles and joints
+- Clean, short natural nails — no nail polish
+- No jewellery, no watch, no rings, no tattoos
+- Bare forearm entering from the bottom edge of the frame, no sleeve visible
+
+COMPOSITION:
+- Single hand only, centred, filling roughly 70% of the frame
+- Forearm vertical, rising from the bottom edge
+- Square 1:1 aspect ratio, high resolution
+- Plain solid warm cream / ivory background (#FDF6E3), completely uniform,
+  no texture, no gradient, no props, no background objects
+
+LIGHTING & STYLE:
+- Soft, even studio lighting from the front-left
+- Gentle natural shadow beneath the hand for depth
+- Photorealistic, sharp focus, neutral medium skin tone
+- Clean commercial reference-photograph aesthetic, like an educational chart
+
+TEXT LABEL:
+- Place the text "Hello" in the TOP RIGHT corner
+- Bold black sans-serif, clean and legible, small (about 8% of image height)
+- The text must be spelled exactly as written, with no other text anywhere
+  in the image
+
+REFERENCES: 
+- Lifeprint / ASL University — https://www.lifeprint.com/asl101/fingerspelling/ (Dr. Bill Vicars; the most widely used free ASL reference)
+- Handspeak — https://www.handspeak.com/spell/ (clear alphabet + word dictionary)
+- Signing Savvy — https://www.signingsavvy.com/ (video per sign — best for the word signs)
+- Gallaudet University — https://gallaudet.edu/ (authoritative Deaf-education source)
