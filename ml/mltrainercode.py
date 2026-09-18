@@ -5,24 +5,41 @@
 
 import os
 import json
+from collections import Counter
 import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 
 import kagglehub
 
+from feature_utils import extract_features, RICH_DIM
+
 print("⏳ Downloading/Locating Kaggle Dataset automatically...")
 base_path = kagglehub.dataset_download("grassknoted/asl-alphabet")
 DATASET_PATH  = os.path.join(base_path, "asl_alphabet_train", "asl_alphabet_train")
+
+# Local, self-collected word dataset (static pose per word). We pull the
+# ALPHABET (A-Z + del/nothing/space) from Kaggle and the WORD classes from
+# here, so we end up with one model that knows both letters and words.
+BASE_DIR           = os.path.dirname(os.path.abspath(__file__))
+WORDS_DATASET_PATH = os.path.join(BASE_DIR, "sign_language_dataset1")
+WORD_CLASSES       = ["Bye", "Deaf", "Hello", "NotOk", "Pen", "Please", "Thankyou", "Yes"]
+
+# Cap images sampled per class. Kaggle has ~3000/letter which would make
+# landmark extraction take hours and drown out the words (which have <100
+# each). Sampling evenly to this cap keeps extraction fast and the classes
+# reasonably balanced.
+MAX_PER_CLASS = 300
+
 EXPORT_DIR    = "exported_model"
-EPOCHS        = 50          # more epochs for better accuracy
+EPOCHS        = 80          # upper bound; early stopping ends it once val plateaus
 BATCH_SIZE    = 64
 LEARNING_RATE = 1e-3
 VAL_SPLIT     = 0.1
@@ -31,13 +48,33 @@ NUM_PREVIEW   = 0           # set to 5 if you want previews
 # ──────────────────────────────────────────────────────────────
 
 
-# ── 1. Discover Labels ────────────────────────────────────────
-labels = sorted([
+# Motion-based letters: their meaning is a movement, so a single frame just
+# looks like another letter (J≈I, Z≈D/pointing). Training on them adds label
+# noise that hurts I and D, so we drop them from the model entirely.
+EXCLUDED_ALPHABET = {"J", "Z"}
+
+# ── 1. Discover Labels & build source list ───────────────────
+# Alphabet + meta classes come from the Kaggle folders...
+alphabet_labels = sorted([
     d for d in os.listdir(DATASET_PATH)
-    if os.path.isdir(os.path.join(DATASET_PATH, d))
+    if os.path.isdir(os.path.join(DATASET_PATH, d)) and d not in EXCLUDED_ALPHABET
 ])
-assert labels, f"No sub-folders found in {DATASET_PATH}"
-print(f"✅ Found {len(labels)} labels: {labels}")
+assert alphabet_labels, f"No sub-folders found in {DATASET_PATH}"
+
+# ...and word classes come from the local dataset (skip any that are missing).
+word_labels = []
+sources = [(lab, os.path.join(DATASET_PATH, lab)) for lab in alphabet_labels]
+for w in WORD_CLASSES:
+    wdir = os.path.join(WORDS_DATASET_PATH, w)
+    if os.path.isdir(wdir):
+        word_labels.append(w)
+        sources.append((w, wdir))
+    else:
+        print(f"  ⚠️  word folder not found, skipping: {wdir}")
+
+labels = sorted(alphabet_labels + word_labels)
+print(f"✅ Found {len(labels)} labels "
+      f"({len(alphabet_labels)} alphabet/meta + {len(word_labels)} words): {labels}")
 
 
 # ── 2. MediaPipe landmark extractor ──────────────────────────
@@ -47,31 +84,48 @@ options      = vision.HandLandmarkerOptions(base_options=base_options, num_hands
 detector     = vision.HandLandmarker.create_from_options(options)
 
 
-def normalize_landmarks(raw: list) -> list:
-    """
-    KEY ACCURACY FIX — normalize landmarks relative to wrist.
-    Raw x/y/z are absolute positions in the image frame.
-    This means the same sign at different positions/scales
-    looks completely different to the model.
-    Normalizing makes position and hand size irrelevant —
-    only the SHAPE of the sign matters.
-    """
-    pts = np.array(raw).reshape(21, 3)
+def _rotation_matrix(ax, ay, az):
+    """Compose a 3D rotation from small pitch/yaw/roll angles (radians)."""
+    cx, sx = np.cos(ax), np.sin(ax)
+    cy, sy = np.cos(ay), np.sin(ay)
+    cz, sz = np.cos(az), np.sin(az)
+    Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
+    Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+    Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
+    return Rz @ Ry @ Rx
 
-    # Translate: make wrist (landmark 0) the origin
-    pts = pts - pts[0]
 
-    # Scale: divide by the distance from wrist to middle finger MCP (landmark 9)
-    # This makes hand size invariant
-    scale = np.linalg.norm(pts[9])
-    if scale > 0:
-        pts = pts / scale
+def augment_landmarks(raw: list) -> list:
+    """
+    Randomly perturb a raw hand pose so the model sees the kind of variation a
+    real webcam produces — the training images are unnaturally clean, which is
+    why detection "works sometimes" live. Applied only to the training set.
+
+      • small 3D rotation  → hand tilted at different angles
+      • horizontal mirror  → left/right hand + the mirrored webcam feed
+      • scale jitter       → hand nearer/further from the camera
+      • gaussian noise     → MediaPipe landmark jitter
+    """
+    pts = np.array(raw, dtype=np.float64).reshape(21, 3)
+    pts = pts - pts[0]                       # rotate/mirror about the wrist
+
+    ax = np.random.uniform(-0.17, 0.17)      # ≈ ±10° pitch
+    ay = np.random.uniform(-0.17, 0.17)      # ≈ ±10° yaw
+    az = np.random.uniform(-0.35, 0.35)      # ≈ ±20° in-plane roll
+    pts = pts @ _rotation_matrix(ax, ay, az).T
+
+    if np.random.rand() < 0.5:               # mirror handedness / feed flip
+        pts[:, 0] = -pts[:, 0]
+
+    pts *= np.random.uniform(0.9, 1.1)       # scale jitter
+    pts += np.random.normal(0, 0.01, pts.shape)  # landmark noise
 
     return pts.flatten().tolist()
 
 
 def extract_landmarks(image_path: str):
-    """Return 63-float NORMALIZED list or None if no hand detected."""
+    """Return RAW 63-float landmark list (x,y,z per point) or None.
+    Normalization + augmentation happen later, per-sample, in the Dataset."""
     try:
         img    = Image.open(image_path).convert('RGB')
         img_np = np.array(img, dtype=np.uint8)
@@ -79,8 +133,7 @@ def extract_landmarks(image_path: str):
         result = detector.detect(mp_img)
         if result.hand_landmarks:
             lm  = result.hand_landmarks[0]
-            raw = [val for pt in lm for val in (pt.x, pt.y, pt.z)]
-            return normalize_landmarks(raw)
+            return [val for pt in lm for val in (pt.x, pt.y, pt.z)]
     except Exception:
         pass
     return None
@@ -91,22 +144,28 @@ print("\n⏳ Extracting hand landmarks...")
 all_data = []
 skipped  = 0
 
-for label in labels:
-    label_dir = os.path.join(DATASET_PATH, label)
-    label_idx = labels.index(label)
+for class_name, class_dir in sources:
+    label_idx = labels.index(class_name)
     found, miss = 0, 0
 
-    for fname in os.listdir(label_dir):
-        if not fname.lower().endswith(('.jpg', '.jpeg', '.png')):
-            continue
-        landmarks = extract_landmarks(os.path.join(label_dir, fname))
+    imgs = sorted([
+        f for f in os.listdir(class_dir)
+        if f.lower().endswith(('.jpg', '.jpeg', '.png'))
+    ])
+    # Evenly sample up to MAX_PER_CLASS so big Kaggle folders don't dominate.
+    if len(imgs) > MAX_PER_CLASS:
+        step = len(imgs) // MAX_PER_CLASS
+        imgs = imgs[::step][:MAX_PER_CLASS]
+
+    for fname in imgs:
+        landmarks = extract_landmarks(os.path.join(class_dir, fname))
         if landmarks:
             all_data.append((landmarks, label_idx))
             found += 1
         else:
             miss += 1
 
-    print(f"  {label:<20} detected={found:>4}  skipped={miss:>4}")
+    print(f"  {class_name:<20} detected={found:>4}  skipped={miss:>4}")
     skipped += miss
 
 print(f"\n✅ Total usable : {len(all_data)}")
@@ -115,33 +174,51 @@ assert len(all_data) > 0, "No landmarks extracted."
 
 
 # ── 4. Dataset ────────────────────────────────────────────────
+# Stores RAW landmarks; normalization runs on every fetch (matching inference),
+# and augmentation is applied to the training set only, fresh each epoch.
 class LandmarkDataset(Dataset):
-    def __init__(self, data):
+    def __init__(self, data, augment=False):
         self.data = data
+        self.augment = augment
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
-        landmarks, label = self.data[idx]
-        return torch.tensor(landmarks, dtype=torch.float32), torch.tensor(label)
+        raw, label = self.data[idx]
+        if self.augment:
+            raw = augment_landmarks(raw)
+        x = extract_features(raw)
+        return torch.tensor(x, dtype=torch.float32), torch.tensor(label)
 
 
-dataset = LandmarkDataset(all_data)
-n       = len(dataset)
+# Deterministic shuffled split (so train gets augmentation, val/test don't).
+import random as _random
+_idxs = list(range(len(all_data)))
+_random.Random(42).shuffle(_idxs)
+
+n       = len(all_data)
 n_val   = max(1, int(VAL_SPLIT  * n))
 n_test  = max(1, int(TEST_SPLIT * n))
-n_train = n - n_val - n_test
+val_data   = [all_data[i] for i in _idxs[:n_val]]
+test_data  = [all_data[i] for i in _idxs[n_val:n_val + n_test]]
+train_data = [all_data[i] for i in _idxs[n_val + n_test:]]
+n_train    = len(train_data)
 
-train_ds, val_ds, test_ds = random_split(
-    dataset, [n_train, n_val, n_test],
-    generator=torch.Generator().manual_seed(42)
-)
+train_ds = LandmarkDataset(train_data, augment=True)
+val_ds   = LandmarkDataset(val_data,   augment=False)
+test_ds  = LandmarkDataset(test_data,  augment=False)
 
 train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  drop_last=True)
 val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False)
 test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False)
 print(f"\nSplit — train:{n_train}  val:{n_val}  test:{n_test}")
+
+# Class-balancing weights: the words have <100 samples each while letters have
+# hundreds, so without this the model would happily ignore the rare classes.
+_counts  = Counter(lbl for _, lbl in train_data)
+_weights = [n_train / (len(labels) * _counts.get(c, 1)) for c in range(len(labels))]
+class_weights = torch.tensor(_weights, dtype=torch.float32)
 
 
 # ── 5. Improved Model ─────────────────────────────────────────
@@ -153,7 +230,7 @@ class GestureClassifier(nn.Module):
 
         # Feature extractor
         self.features = nn.Sequential(
-            nn.Linear(63, 512),
+            nn.Linear(RICH_DIM, 512),
             nn.BatchNorm1d(512),
             nn.ReLU(),
             nn.Dropout(0.4),
@@ -169,8 +246,8 @@ class GestureClassifier(nn.Module):
             nn.Dropout(0.2),
         )
 
-        # Skip connection projection (63 -> 128)
-        self.skip = nn.Linear(63, 128)
+        # Skip connection projection (RICH_DIM -> 128)
+        self.skip = nn.Linear(RICH_DIM, 128)
 
         # Classifier head
         self.classifier = nn.Sequential(
@@ -193,15 +270,19 @@ total_params = sum(p.numel() for p in model.parameters())
 print(f"\n🖥️  Training on: {device}  |  Parameters: {total_params:,}")
 
 
-# ── 6. Training with label smoothing ─────────────────────────
-# Label smoothing reduces overconfidence — model generalises better
-criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+# ── 6. Training with label smoothing + class weights ─────────
+# Label smoothing reduces overconfidence; class weights stop the rare word
+# classes from being drowned out by the letters.
+criterion = nn.CrossEntropyLoss(weight=class_weights.to(device), label_smoothing=0.1)
 optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
 scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+
+EARLY_STOP_PATIENCE = 12   # stop if val accuracy hasn't improved in this many epochs
 
 train_acc_history = []
 val_acc_history   = []
 best_val_acc      = 0.0
+epochs_since_best = 0
 
 print("\n── Training ──────────────────────────────────────────────")
 for epoch in range(1, EPOCHS + 1):
@@ -234,18 +315,28 @@ for epoch in range(1, EPOCHS + 1):
     train_acc_history.append(train_acc)
     val_acc_history.append(val_acc)
 
-    if val_acc > best_val_acc:
+    improved = val_acc > best_val_acc
+    if improved:
         best_val_acc = val_acc
+        epochs_since_best = 0
         os.makedirs(EXPORT_DIR, exist_ok=True)
         torch.save(model.state_dict(), os.path.join(EXPORT_DIR, "best_checkpoint.pth"))
+    else:
+        epochs_since_best += 1
 
     print(
         f"Epoch {epoch:02d}/{EPOCHS}  "
         f"loss={total_loss/len(train_loader):.4f}  "
         f"train={train_acc:.2%}  "
         f"val={val_acc:.2%}"
-        + ("  ← best" if val_acc == best_val_acc else "")
+        + ("  ← best" if improved else "")
     )
+
+    # Augmentation means val accuracy wanders a bit; only stop after a real
+    # plateau, and keep the best checkpoint regardless.
+    if epochs_since_best >= EARLY_STOP_PATIENCE:
+        print(f"\n⏹️  No val improvement for {EARLY_STOP_PATIENCE} epochs — stopping early.")
+        break
 
 print(f"\n🏆 Best val accuracy: {best_val_acc:.2%}")
 

@@ -7,11 +7,12 @@ import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 from collections import deque, Counter
-from flask import Flask
+from flask import Flask, request, jsonify
 from flask_socketio import SocketIO, emit
 from flask_cors import CORS
 
 from Hand_avatar import HandAvatar3D
+from feature_utils import features_for_dim, BASIC_DIM
 
 # Ensure headless PyOpenGL
 os.environ["SDL_VIDEODRIVER"] = "dummy"
@@ -33,12 +34,12 @@ except FileNotFoundError:
 
 # ── MODEL ─────────────────────────────────────────────────────
 class GestureClassifier(nn.Module):
-    def __init__(self, num_classes: int):
+    def __init__(self, num_classes: int, in_features: int):
         super().__init__()
 
         # Feature extractor
         self.features = nn.Sequential(
-            nn.Linear(63, 512),
+            nn.Linear(in_features, 512),
             nn.BatchNorm1d(512),
             nn.ReLU(),
             nn.Dropout(0.4),
@@ -54,8 +55,8 @@ class GestureClassifier(nn.Module):
             nn.Dropout(0.2),
         )
 
-        # Skip connection projection (63 -> 128)
-        self.skip = nn.Linear(63, 128)
+        # Skip connection projection (in_features -> 128)
+        self.skip = nn.Linear(in_features, 128)
 
         # Classifier head
         self.classifier = nn.Sequential(
@@ -71,23 +72,28 @@ class GestureClassifier(nn.Module):
         out      = features + skip       # merge
         return self.classifier(out)
 
-model = GestureClassifier(len(labels))
+
+# Auto-detect the model's expected input size from the checkpoint so an old
+# 63-dim model and a new rich model both load without any code change here.
+MODEL_IN_FEATURES = BASIC_DIM
+model = None
 if os.path.exists(MODEL_PATH):
-    model.load_state_dict(torch.load(MODEL_PATH, map_location='cpu'))
-model.eval()
+    state = torch.load(MODEL_PATH, map_location='cpu')
+    MODEL_IN_FEATURES = state['features.0.weight'].shape[1]
+    model = GestureClassifier(len(labels), MODEL_IN_FEATURES)
+    model.load_state_dict(state)
+    model.eval()
+    print(f"Loaded model: {len(labels)} classes, {MODEL_IN_FEATURES}-dim input.")
+else:
+    print(f"Warning: model file not found at {MODEL_PATH}")
 
-# ── NORMALIZE + PREDICT ───────────────────────────────────────
-def normalize_landmarks(raw):
-    pts = np.array(raw).reshape(21, 3)
-    pts = pts - pts[0]
-    scale = np.linalg.norm(pts[9])
-    if scale > 0: pts /= scale
-    return pts.flatten()
-
+# ── PREDICT ───────────────────────────────────────────────────
 def predict(raw):
-    if len(labels) == 0:
+    if model is None or len(labels) == 0:
         return "Unknown", 0.0
-    x = torch.tensor(normalize_landmarks(raw), dtype=torch.float32).unsqueeze(0)
+    # Use whichever feature representation matches the loaded model.
+    feats = features_for_dim(raw, MODEL_IN_FEATURES)
+    x = torch.tensor(feats, dtype=torch.float32).unsqueeze(0)
     with torch.no_grad():
         probs = torch.softmax(model(x), dim=1)
         conf, idx = probs.max(dim=1)
@@ -132,6 +138,39 @@ class HandState:
         self.label = best
         self.conf  = sum(confs) / len(confs)
 
+# ── SIGN-TO-TEXT (continuous fingerspelling) ──────────────────
+# Word breaks and corrections are driven by the keyboard (space /
+# backspace) rather than the "space"/"del" gesture classes, so only
+# actual letters get auto-committed here.
+LETTER_SET = set(labels) - {"del", "nothing", "space"}
+
+TEXT_HOLD_FRAMES_NEED = 14   # frames a stable letter must hold before it's committed
+TEXT_COOLDOWN_FRAMES  = 12   # frames of "no sign / different sign" before the same letter can repeat
+
+class TextSession:
+    def __init__(self):
+        self.hist         = deque(maxlen=SMOOTH_FRAMES)
+        self.label        = ""
+        self.conf         = 0.0
+        self.sentence     = ""
+        self.hold_counter = 0
+        self.cooldown     = 0
+        self.last_label   = ""
+
+    def update(self, l, c):
+        if c < CONFIDENCE_MIN: return
+        self.hist.append((l, c))
+        if len(self.hist) < 5: return
+        votes = Counter([x[0] for x in self.hist])
+        best  = votes.most_common(1)[0][0]
+        confs = [x[1] for x in self.hist if x[0] == best]
+        self.label = best
+        self.conf  = sum(confs) / len(confs)
+
+# Per-connection state, keyed by socket id, so concurrent users don't
+# share a sentence buffer.
+text_sessions = {}
+
 # Setup Flask server
 app = Flask(__name__)
 CORS(app)
@@ -166,13 +205,27 @@ init_globals()
 def index():
     return "DrishtiSign ML Web Socket Server is running."
 
+@app.route('/labels')
+def get_labels():
+    """The model's real vocabulary, so the frontend never hard-codes a sign
+    list that can drift out of sync with what the model was trained on."""
+    return jsonify(labels)
+
 @socketio.on('connect')
 def test_connect():
     print('Client connected')
+    # Clear any smoothing state left over from a previous session so a stale
+    # label can't linger into the first few frames of a fresh modal.
+    global last_label
+    last_label = ""
+    for h in hands:
+        h.hist.clear()
+        h.label, h.conf = "", 0.0
 
 @socketio.on('disconnect')
 def test_disconnect():
     print('Client disconnected')
+    text_sessions.pop(request.sid, None)
 
 @socketio.on('video_frame')
 def handle_video_frame(data):
@@ -292,6 +345,100 @@ def handle_video_frame(data):
         'label': active_label if active_label else "",
         'confidence': max(hands[0].conf, hands[1].conf) if active_label else 0.0
     })
+
+@socketio.on('text_frame')
+def handle_text_frame(data):
+    """
+    Continuous fingerspelling mode. Holds a stable letter for
+    TEXT_HOLD_FRAMES_NEED frames before committing it to the session's
+    sentence buffer. Word breaks / corrections come from the keyboard
+    (see handle_text_key), not from gesture classes.
+    """
+    if not data.startswith("data:image"):
+        return
+
+    sid = request.sid
+    session = text_sessions.setdefault(sid, TextSession())
+
+    encoded_data = data.split(',')[1]
+    nparr = np.frombuffer(base64.b64decode(encoded_data), np.uint8)
+    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if frame is None:
+        return
+
+    rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+
+    res = detector.detect(mp_img) if detector else None
+
+    detected = False
+    if res and res.hand_landmarks:
+        lm = res.hand_landmarks[0]
+        draw_landmarks(frame, lm)
+        raw         = [v for p in lm for v in (p.x, p.y, p.z)]
+        label, conf = predict(raw)
+        session.update(label, conf)
+        detected = True
+
+    if not detected:
+        session.label, session.conf = "", 0.0
+
+    current = session.label
+
+    # Hold-to-commit: a letter must stay steady for a stretch of frames,
+    # then a cooldown gap is required before the same letter can repeat
+    # (so one held sign doesn't spam the same letter over and over).
+    if session.cooldown > 0:
+        session.cooldown -= 1
+        session.hold_counter = 0
+        if current != session.last_label:
+            session.cooldown = 0
+    elif current and current in LETTER_SET:
+        if current == session.last_label:
+            session.hold_counter += 1
+        else:
+            session.hold_counter = 1
+            session.last_label = current
+
+        if session.hold_counter >= TEXT_HOLD_FRAMES_NEED:
+            session.sentence += current
+            session.hold_counter = 0
+            session.cooldown     = TEXT_COOLDOWN_FRAMES
+    else:
+        session.hold_counter = 0
+        session.last_label   = ""
+
+    hold_progress = min(1.0, session.hold_counter / TEXT_HOLD_FRAMES_NEED)
+
+    cv2.rectangle(frame, (0, 0), (frame.shape[1], 40), (20, 20, 20), -1)
+    cv2.putText(frame, "DrishtiSign  |  Sign to Text", (15, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 220, 120), 2, cv2.LINE_AA)
+
+    _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    out_b64 = base64.b64encode(buffer).decode('utf-8')
+
+    emit('text_processed_frame', {
+        'image': f"data:image/jpeg;base64,{out_b64}",
+        'label': current,
+        'confidence': session.conf,
+        'holdProgress': hold_progress,
+        'sentence': session.sentence,
+    })
+
+@socketio.on('text_key')
+def handle_text_key(data):
+    """Keyboard-driven word breaks / corrections: {action: 'space' | 'backspace' | 'clear'}."""
+    sid = request.sid
+    session = text_sessions.setdefault(sid, TextSession())
+    action = (data or {}).get('action')
+
+    if action == 'space':
+        session.sentence += ' '
+    elif action == 'backspace':
+        session.sentence = session.sentence[:-1]
+    elif action == 'clear':
+        session.sentence = ''
+
+    emit('text_processed_frame', {'sentence': session.sentence})
 
 if __name__ == '__main__':
     print("Starting DrishtiSign ML Socket Server on port 5002...")
