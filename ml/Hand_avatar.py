@@ -111,7 +111,11 @@ def draw_cylinder(p1, p2, r, color):
     M[:3,0]=x; M[:3,1]=y; M[:3,2]=z; M[:3,3]=p1
 
     glPushMatrix()
-    glMultMatrixf(M)
+    # glMultMatrixf expects its 16 floats in column-major order, but a numpy
+    # array flattens row-major by default - passing M directly silently
+    # transposes it, scrambling almost every cylinder's orientation (this was
+    # the actual cause of the "gibberish" rendering, not the pose data).
+    glMultMatrixf(M.T)
     q = gluNewQuadric()
     gluQuadricNormals(q, GLU_SMOOTH)
     gluCylinder(q, r, r * 0.85, length, 16, 2)   # slight taper
@@ -120,29 +124,51 @@ def draw_cylinder(p1, p2, r, color):
 
 
 # ── Landmark processing ───────────────────────────────────────
-def landmarks_to_3d(frame_data):
+def _raw_to_array(frame_data):
     """
-    Convert stored [x, y] (or [x, y, z]) landmark list to a
-    centred, normalised (21, 3) numpy array ready for rendering.
+    Stored [x, y] or [x, y, z] landmarks -> (21, 3) float array.
+
+    No Y flip here: build_sign_poses.py already canonicalises each hand into
+    an upright, palm-forward frame where +Y is up. (The old flip existed
+    because the poses used to be raw MediaPipe *image* coordinates, which are
+    top-down - applying it now would render every sign upside down.)
     """
-    pts = np.array([[p[0], p[1], p[2] if len(p) > 2 else 0.0]
-                    for p in frame_data], dtype=np.float32)
+    return np.array([[p[0], p[1], p[2] if len(p) > 2 else 0.0]
+                     for p in frame_data], dtype=np.float32)
 
-    # Flip Y — MediaPipe Y is top-down, OpenGL Y is up
-    pts[:, 1] = 1.0 - pts[:, 1]
 
-    # Centre on wrist
-    pts -= pts[0]
+def sequence_to_3d(raw_frames):
+    """
+    Convert a whole recorded sequence into render-ready frames.
 
-    # Scale so the hand fills ~0.8 units
-    span = np.max(np.linalg.norm(pts, axis=1))
+    Normalisation is done ACROSS the sequence, not per frame: every frame is
+    centred and scaled using the same reference (the first frame's wrist and
+    the sequence's overall extent). Normalising each frame on its own wrist -
+    as this used to - would subtract out exactly the wrist movement that makes
+    a word sign a sign, freezing "Hello" into a stationary hand.
+    """
+    frames = [_raw_to_array(f) for f in raw_frames]
+
+    origin = frames[0][0].copy()               # first frame's wrist
+    centred = [f - origin for f in frames]
+
+    # One shared scale so the hand keeps a constant size as it travels.
+    span = max(float(np.max(np.linalg.norm(f, axis=1))) for f in centred)
     if span > 1e-6:
-        pts = pts / span * 0.8
+        centred = [f / span * 0.8 for f in centred]
 
-    # Shift hand to a nice view position (wrist at origin, palm faces camera)
-    pts[:, 2] -= 0.1    # push slightly back for depth feel
+    # Keep the whole motion roughly centred in view rather than drifting off.
+    mean_offset = np.mean([f.mean(axis=0) for f in centred], axis=0)
+    centred = [f - mean_offset for f in centred]
 
-    return pts
+    for f in centred:
+        f[:, 2] -= 0.1                          # slight push back for depth
+    return centred
+
+
+def landmarks_to_3d(frame_data):
+    """Single-frame convenience wrapper (kept for any external callers)."""
+    return sequence_to_3d([frame_data])[0]
 
 
 # ── Main avatar class ─────────────────────────────────────────
@@ -164,10 +190,14 @@ class HandAvatar3D:
         self.last_time = time.time()
         self.speed     = 0.025
 
-        # Rotation state (mouse / auto-rotate)
-        self.rot_x  = -15.0
-        self.rot_y  =  20.0
-        self.auto_rotate = True
+        # Fixed three-quarter view: enough angle for the depth to read, but
+        # stable. Continuously spinning the hand makes a sign much harder to
+        # follow when you're trying to copy it, so auto-rotate is off.
+        self.rot_x  = -10.0
+        self.rot_y  =  18.0
+        self.auto_rotate = False
+
+        self.direction = 1   # ping-pong playback (see draw())
 
         self._init_gl()
 
@@ -176,7 +206,13 @@ class HandAvatar3D:
         if not pygame.get_init():
             pygame.init()
 
-        # Hidden offscreen OpenGL window
+        # Push the window far off any real monitor so it's never actually
+        # visible on screen, while still being a real window SDL will give
+        # a genuine OpenGL context for (a fully headless/dummy driver has no
+        # rendering backend at all - see server.py's note on that). Must be
+        # set before set_mode() creates the window.
+        os.environ['SDL_VIDEO_WINDOW_POS'] = '-32000,-32000'
+
         self._screen = pygame.display.set_mode(
             (self.W, self.H), DOUBLEBUF | OPENGL | NOFRAME)
         pygame.display.set_caption("Hand Avatar")
@@ -216,9 +252,12 @@ class HandAvatar3D:
             if os.path.exists(fpath):
                 with open(fpath) as f:
                     raw = json.load(f)
-                self.frames    = [landmarks_to_3d(frame) for frame in raw]
+                # Normalise the sequence as a whole so wrist movement between
+                # keyframes survives (see sequence_to_3d).
+                self.frames    = sequence_to_3d(raw)
                 self.frame_idx = 0
                 self.step      = 0
+                self.direction = 1
                 self.current   = name
                 print(f"[HandAvatar3D] Loaded '{name}' — {len(self.frames)} frames")
                 return
@@ -254,7 +293,17 @@ class HandAvatar3D:
             self.step += 1
             if self.step >= self.steps_per_frame:
                 self.step = 0
-                self.frame_idx = (self.frame_idx + 1) % (len(self.frames) - 1)
+                # Ping-pong rather than wrapping: a one-directional sign like
+                # "Hello" would otherwise snap from its end pose back to its
+                # start every loop. Playing it forwards then backwards reads as
+                # a natural repeat.
+                self.frame_idx += self.direction
+                if self.frame_idx >= len(self.frames) - 1:
+                    self.frame_idx = max(len(self.frames) - 2, 0)
+                    self.direction = -1
+                elif self.frame_idx <= 0:
+                    self.frame_idx = 0
+                    self.direction = 1
 
         if self.auto_rotate:
             self.rot_y = (self.rot_y + 0.4) % 360
@@ -324,6 +373,16 @@ class HandAvatar3D:
                     (140, 140, 140), 1, cv2.LINE_AA)
 
         canvas[:] = bgr
+
+    def pump_events(self):
+        """
+        Drain the OS event queue for this (off-screen) window. macOS marks a
+        window "not responding" - and refuses to quit it normally - if its
+        event queue isn't serviced regularly. draw() only runs while frames
+        are actively being rendered, so the caller should also invoke this
+        on its own periodic timer to keep the window alive even when idle.
+        """
+        pygame.event.pump()
 
     def close(self):
         pygame.quit()
