@@ -40,7 +40,8 @@ import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 
-from word_sequences import SEQ_LEN, FEATURE_DIM, VOCABULARY, sequence_from_video
+from word_sequences import (SEQ_LEN, FEATURE_DIM, VOCABULARY, WordSignGRU,
+                            sequence_from_video)
 
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 LANDMARKER = os.path.join(BASE_DIR, "hand_landmarker.task")
@@ -54,40 +55,6 @@ LEARNING_RATE = 1e-3
 VAL_SPLIT     = 0.15
 TEST_SPLIT    = 0.15
 EARLY_STOP    = 20
-
-# ── model ─────────────────────────────────────────────────────
-class WordSignGRU(nn.Module):
-    """
-    Bidirectional GRU over the clip, then classify.
-
-    Bidirectional because a sign's meaning depends on the whole movement -
-    where it ends matters as much as where it starts - so the model should
-    see the sequence from both directions before deciding.
-    """
-
-    def __init__(self, num_classes, feature_dim=FEATURE_DIM, hidden=128):
-        super().__init__()
-        self.norm = nn.LayerNorm(feature_dim)
-        self.gru = nn.GRU(feature_dim, hidden, num_layers=2, batch_first=True,
-                          bidirectional=True, dropout=0.3)
-        # hidden*2 final states + hidden*2 mean-pooled = hidden*4
-        self.head = nn.Sequential(
-            nn.Linear(hidden * 4, 128), nn.ReLU(), nn.Dropout(0.3),
-            nn.Linear(128, num_classes),
-        )
-
-    def forward(self, x):                       # x: (B, SEQ_LEN, FEATURE_DIM)
-        out, h_n = self.gru(self.norm(x))
-
-        # Mean-pooling ALONE is direction-blind: a movement outward and the
-        # same movement inward average to the same thing, and for sign
-        # language that difference is meaning. So combine the final forward
-        # and backward hidden states (which encode where the motion ended up)
-        # with the mean (which is robust to dead frames at the clip edges).
-        final = torch.cat([h_n[-2], h_n[-1]], dim=1)
-        pooled = torch.cat([final, out.mean(dim=1)], dim=1)
-        return self.head(pooled)
-
 
 class SeqDataset(Dataset):
     def __init__(self, X, y, augment=False):

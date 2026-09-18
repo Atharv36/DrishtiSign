@@ -18,6 +18,8 @@ train_word_model.py (any folder of per-word videos, e.g. WLASL).
 """
 
 import numpy as np
+import torch
+import torch.nn as nn
 
 from feature_utils import extract_features, RICH_DIM
 
@@ -36,6 +38,42 @@ VOCABULARY = [
     "understand", "what", "where", "who", "how", "more", "stop", "go",
     "happy", "sad", "name", "you", "me",
 ]
+
+
+class WordSignGRU(nn.Module):
+    """
+    Bidirectional GRU over a clip, then classify.
+
+    Lives here rather than in the trainer so the training script and the
+    inference server share ONE definition - if they drifted apart, the saved
+    weights would silently stop matching the architecture loading them.
+
+    Bidirectional because a sign's meaning depends on the whole movement:
+    where it ends matters as much as where it starts.
+    """
+
+    def __init__(self, num_classes, feature_dim=FEATURE_DIM, hidden=128):
+        super().__init__()
+        self.norm = nn.LayerNorm(feature_dim)
+        self.gru = nn.GRU(feature_dim, hidden, num_layers=2, batch_first=True,
+                          bidirectional=True, dropout=0.3)
+        # hidden*2 final states + hidden*2 mean-pooled = hidden*4
+        self.head = nn.Sequential(
+            nn.Linear(hidden * 4, 128), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(128, num_classes),
+        )
+
+    def forward(self, x):                       # x: (B, SEQ_LEN, FEATURE_DIM)
+        out, h_n = self.gru(self.norm(x))
+
+        # Mean-pooling ALONE is direction-blind: a movement outward and the
+        # same movement inward average to the same thing, and for sign
+        # language that difference is meaning. So combine the final forward
+        # and backward hidden states (which encode where the motion ended up)
+        # with the mean (which is robust to dead frames at the clip edges).
+        final = torch.cat([h_n[-2], h_n[-1]], dim=1)
+        pooled = torch.cat([final, out.mean(dim=1)], dim=1)
+        return self.head(pooled)
 
 
 def frame_features(hand_landmarks):

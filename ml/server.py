@@ -11,31 +11,24 @@ from flask import Flask, request, jsonify
 from flask_socketio import SocketIO, emit
 from flask_cors import CORS
 
-from Hand_avatar import HandAvatar3D
 from feature_utils import features_for_dim, BASIC_DIM
 from text_to_sign import translate as translate_text_to_sign
+from word_sequences import (SEQ_LEN, FEATURE_DIM, WordSignGRU,
+                            frame_features, resample)
 
-# Creating a real (even off-screen) SDL/OpenGL window turns this process into
-# a full macOS Cocoa app under the hood, which then ignores plain SIGTERM/
-# SIGINT in favor of its own Apple Event quit protocol - Ctrl+C or a normal
-# `kill` silently does nothing, and the window shows as "not responding."
-# Installing explicit handlers that call os._exit() forces an immediate,
-# unconditional process exit that bypasses that entirely.
+# Force an immediate exit on Ctrl+C / kill. Eventlet's greenlet scheduling can
+# swallow or delay the default signal handling, so an explicit os._exit() keeps
+# stopping the server reliable.
+# (This originally worked around the 3D avatar's SDL/OpenGL window turning the
+# process into a macOS Cocoa app that ignored SIGTERM entirely. The avatar has
+# since been removed - no OpenGL, no window - but reliable Ctrl+C is worth
+# keeping regardless.)
 def _force_exit(signum, frame):
     print(f"\nReceived signal {signum}, shutting down...")
     os._exit(0)
 
 signal.signal(signal.SIGINT, _force_exit)
 signal.signal(signal.SIGTERM, _force_exit)
-
-# NOTE: this used to force SDL_VIDEODRIVER=dummy to try to run "headless" -
-# but the dummy driver has no real rendering backend at all, so it made
-# every OpenGL context creation in Hand_avatar.py silently fail (caught by
-# the broad try/except in init_globals() below), leaving `avatar = None`
-# for the entire app's lifetime. The 3D hand avatar has never actually
-# rendered as a result. Letting pygame use the real (Cocoa) driver fixes
-# this; the window it opens is borderless (NOFRAME, see Hand_avatar.py)
-# and only its rendered pixels are read back and streamed to the browser.
 
 # ── CONFIG ────────────────────────────────────────────────────
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
@@ -196,6 +189,54 @@ text_sessions = {}
 # new translation (or a disconnect) can cancel a running sequence.
 sign_sessions = {}
 
+# ── WORD MODEL (motion signs) ─────────────────────────────────
+# Loaded alongside the letter model, never replacing it. A letter is a static
+# handshape (one frame -> MLP); a word sign is a movement (a sequence -> GRU),
+# so they are genuinely different models and the letter path stays untouched.
+WORD_MODEL_PATH  = os.path.join(BASE_DIR, "exported_model", "word_model.pth")
+WORD_LABELS_PATH = os.path.join(BASE_DIR, "exported_model", "word_labels.json")
+
+WORD_CONFIDENCE_MIN = 0.55   # below this we say nothing rather than guess
+WORD_STABLE_NEEDED  = 4      # consecutive agreeing predictions before committing
+
+word_model, word_labels = None, []
+try:
+    if os.path.exists(WORD_MODEL_PATH) and os.path.exists(WORD_LABELS_PATH):
+        word_labels = json.load(open(WORD_LABELS_PATH))
+        word_model = WordSignGRU(len(word_labels))
+        word_model.load_state_dict(torch.load(WORD_MODEL_PATH, map_location='cpu'))
+        word_model.eval()
+        print(f"Loaded word model: {len(word_labels)} words.")
+    else:
+        print("No word model found - word mode disabled (train_word_model.py).")
+except Exception as e:
+    print("Failed to load word model:", e)
+    word_model = None
+
+
+class WordSession:
+    """
+    Per-connection state for word recognition.
+
+    Holds a rolling window of the most recent SEQ_LEN frames, so the model can
+    be run continuously over live video rather than needing a pre-cut clip.
+    """
+
+    def __init__(self):
+        self.buffer = deque(maxlen=SEQ_LEN)
+        self.sentence = ""
+        self.candidate = ""
+        self.stable = 0
+
+    def reset_after_commit(self):
+        # Clear the window so the sign just committed can't immediately
+        # re-trigger from the frames still sitting in the buffer.
+        self.buffer.clear()
+        self.candidate, self.stable = "", 0
+
+
+word_sessions = {}
+
 TEXT_TO_SIGN_HOLD_SECONDS = 1.3   # how long each sign stays on screen
 TEXT_TO_SIGN_FRAME_INTERVAL = 0.08  # ~12fps pushed to the client
 
@@ -206,12 +247,11 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
 # Global state for instances
 detector = None
-avatar = None
 last_label = ""
 hands = [HandState(), HandState()]
 
 def init_globals():
-    global detector, avatar
+    global detector
     try:
         detector = vision.HandLandmarker.create_from_options(
             vision.HandLandmarkerOptions(
@@ -223,27 +263,10 @@ def init_globals():
                 min_tracking_confidence=0.3,
             )
         )
-        avatar = HandAvatar3D(width=400, height=400)
     except Exception as e:
-        print("Failed to initialize Mediapipe/Avatar:", e)
-
-def pump_avatar_events():
-    """Keep the avatar's (off-screen) window event queue alive for the whole
-    process lifetime, not just while frames are being drawn - see
-    HandAvatar3D.pump_events(). Without this, macOS considers the window
-    unresponsive once nothing has rendered for a while and it can't be
-    quit normally."""
-    while True:
-        if avatar is not None:
-            try:
-                avatar.pump_events()
-            except Exception:
-                pass
-        socketio.sleep(0.2)
+        print("Failed to initialize Mediapipe:", e)
 
 init_globals()
-if avatar is not None:
-    socketio.start_background_task(pump_avatar_events)
 
 @app.route('/')
 def index():
@@ -270,6 +293,7 @@ def test_connect():
 def test_disconnect():
     print('Client disconnected')
     text_sessions.pop(request.sid, None)
+    word_sessions.pop(request.sid, None)
     session = sign_sessions.pop(request.sid, None)
     if session:
         session['stop'] = True
@@ -278,9 +302,9 @@ def test_disconnect():
 def handle_video_frame(data):
     """
     Receives base64 encoded jpeg from frontend.
-    Runs Mediapipe, predicts gesture, renders 3D avatar & UI, returns base64 jpeg.
+    Runs Mediapipe, predicts the gesture, draws the overlay, returns base64 jpeg.
     """
-    global avatar, last_label, detector
+    global last_label, detector
     
     if not data.startswith("data:image"):
         return
@@ -328,10 +352,8 @@ def handle_video_frame(data):
     elif right_detected and hands[1].label:
         active_label = hands[1].label
 
-    if avatar:
-        if active_label and active_label != last_label:
-            avatar.load_gesture(active_label)
-            last_label = active_label
+    if active_label and active_label != last_label:
+        last_label = active_label
 
     if not left_detected:
         hands[0].label, hands[0].conf = "", 0.0
@@ -346,15 +368,13 @@ def handle_video_frame(data):
     panel   = np.full((panel_h, w, 3), (18, 18, 25), dtype=np.uint8)
     cv2.line(panel, (0, 0), (w, 0), (50, 50, 60), 1)
 
-    avatar_x = w // 4
-    avatar_w = w // 2
-    if avatar and avatar_w > 0:
-        avatar.draw(panel[:, avatar_x : avatar_x + avatar_w])
+    mid_x = w // 4
+    mid_w = w // 2
 
-    cv2.line(panel, (avatar_x, 0),            (avatar_x, panel_h),            (50,50,60), 1)
-    cv2.line(panel, (avatar_x + avatar_w, 0), (avatar_x + avatar_w, panel_h), (50,50,60), 1)
+    cv2.line(panel, (mid_x, 0),            (mid_x, panel_h),            (50,50,60), 1)
+    cv2.line(panel, (mid_x + mid_w, 0), (mid_x + mid_w, panel_h), (50,50,60), 1)
 
-    info_w = max(avatar_x - 30, 10)
+    info_w = max(mid_x - 30, 10)
     lbl_l  = hands[0].label or "—"
     conf_l = int(hands[0].conf * 100)
     cv2.putText(panel, "LEFT HAND", (15, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (120,120,140), 1, cv2.LINE_AA)
@@ -363,7 +383,7 @@ def handle_video_frame(data):
     cv2.rectangle(panel, (15, 132), (15 + info_w, 140), (50,50,60), -1)
     cv2.rectangle(panel, (15, 132), (15 + int(info_w*hands[0].conf), 140), (0,200,120), -1)
 
-    rx     = avatar_x + avatar_w + 15
+    rx     = mid_x + mid_w + 15
     lbl_r  = hands[1].label or "—"
     conf_r = int(hands[1].conf * 100)
     cv2.putText(panel, "RIGHT HAND", (rx, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (120,120,140), 1, cv2.LINE_AA)
@@ -487,15 +507,95 @@ def handle_text_key(data):
 
     emit('text_processed_frame', {'sentence': session.sentence})
 
-# ── TEXT -> SIGN (typed sentence -> avatar plays the signs) ──────
-# Unlike video_frame/text_frame, there's no incoming camera stream driving
-# the pace here, so the server itself pushes frames on a timer via a
-# background greenlet - the standard eventlet pattern for server-initiated
-# streaming. It reuses the single global `avatar` (see init_globals): a
-# second HandAvatar3D would fight over pygame's one display surface, so if
-# Text->Sign and live detection run in two tabs at once they'll visibly
-# interrupt each other - an accepted limitation, same class as the other
-# global detection state in this file.
+# ── WORD RECOGNITION (motion signs -> text) ─────────────────────
+# Same shape as text_frame, but instead of classifying each frame on its own
+# it keeps a rolling window of the last SEQ_LEN frames and runs the temporal
+# model over the whole window - which is what lets it recognise a movement
+# rather than a pose.
+@socketio.on('word_frame')
+def handle_word_frame(data):
+    if not data.startswith("data:image"):
+        return
+
+    sid = request.sid
+    session = word_sessions.setdefault(sid, WordSession())
+
+    if word_model is None:
+        emit('word_processed_frame', {'error': 'Word model not loaded on the server.'})
+        return
+
+    nparr = np.frombuffer(base64.b64decode(data.split(',')[1]), np.uint8)
+    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if frame is None:
+        return
+
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    res = detector.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)) if detector else None
+
+    if res and res.hand_landmarks:
+        lm = res.hand_landmarks[0]
+        draw_landmarks(frame, lm)
+        session.buffer.append(frame_features(lm))
+    # A gap with no hand is meaningful - it separates one sign from the next -
+    # so we simply stop feeding the buffer rather than clearing it outright.
+
+    label, confidence = "", 0.0
+    committed = None
+
+    if len(session.buffer) == SEQ_LEN:
+        seq = resample(np.array(session.buffer))
+        with torch.no_grad():
+            probs = torch.softmax(
+                word_model(torch.tensor(seq, dtype=torch.float32).unsqueeze(0)), dim=1)
+            conf, idx = probs.max(dim=1)
+        label, confidence = word_labels[idx.item()], float(conf.item())
+
+        # Dwell before committing, mirroring the fingerspelling logic: the same
+        # word has to win several predictions in a row, so a single frame of a
+        # half-formed sign can't type a word.
+        if confidence >= WORD_CONFIDENCE_MIN:
+            if label == session.candidate:
+                session.stable += 1
+            else:
+                session.candidate, session.stable = label, 1
+
+            if session.stable >= WORD_STABLE_NEEDED:
+                session.sentence += (" " if session.sentence else "") + label
+                committed = label
+                session.reset_after_commit()
+        else:
+            session.candidate, session.stable = "", 0
+
+    _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    emit('word_processed_frame', {
+        'image': f"data:image/jpeg;base64,{base64.b64encode(buffer).decode('utf-8')}",
+        'label': label,
+        'confidence': confidence,
+        'bufferProgress': len(session.buffer) / SEQ_LEN,
+        'stableProgress': min(1.0, session.stable / WORD_STABLE_NEEDED),
+        'committed': committed,
+        'sentence': session.sentence,
+    })
+
+
+@socketio.on('word_key')
+def handle_word_key(data):
+    """Corrections for word mode: {action: 'backspace' | 'clear'}."""
+    sid = request.sid
+    session = word_sessions.setdefault(sid, WordSession())
+    action = (data or {}).get('action')
+
+    if action == 'backspace':
+        session.sentence = " ".join(session.sentence.split()[:-1])
+    elif action == 'clear':
+        session.sentence = ''
+
+    emit('word_processed_frame', {'sentence': session.sentence})
+
+# ── TEXT -> SIGN (typed sentence -> ordered sign queue) ─────────
+# The server only does the language work: English -> ASL gloss -> an ordered
+# queue of signs to show. Playback is the frontend's job, so this path needs
+# no rendering, no OpenGL and no background streaming task.
 MAX_SIGN_QUEUE = 60  # ~1.5 min of playback at TEXT_TO_SIGN_HOLD_SECONDS each
 
 @socketio.on('translate_text')
@@ -536,45 +636,6 @@ def handle_translate_text(data):
         'queue': queue,
     })
 
-    socketio.start_background_task(play_sign_queue, sid, queue, session)
-
-
-def play_sign_queue(sid, queue, session):
-    if avatar is None:
-        socketio.emit('sign_translate_error', {
-            'message': 'The 3D avatar failed to initialize on the server.'
-        }, room=sid)
-        return
-
-    for idx, unit in enumerate(queue):
-        if session.get('stop'):
-            return
-
-        avatar.load_gesture(unit['label'])
-        hold_until = time.time() + TEXT_TO_SIGN_HOLD_SECONDS
-
-        while time.time() < hold_until:
-            if session.get('stop'):
-                return
-
-            canvas = np.zeros((400, 400, 3), dtype=np.uint8)
-            avatar.draw(canvas)
-            _, buffer = cv2.imencode('.jpg', canvas, [cv2.IMWRITE_JPEG_QUALITY, 80])
-            out_b64 = base64.b64encode(buffer).decode('utf-8')
-
-            socketio.emit('sign_processed_frame', {
-                'image': f"data:image/jpeg;base64,{out_b64}",
-                'index': idx,
-                'total': len(queue),
-                'label': unit['label'],
-                'word': unit['word'],
-                'kind': unit['kind'],
-            }, room=sid)
-
-            socketio.sleep(TEXT_TO_SIGN_FRAME_INTERVAL)
-
-    if not session.get('stop'):
-        socketio.emit('sign_sequence_done', {}, room=sid)
 
 
 @socketio.on('stop_sign_sequence')

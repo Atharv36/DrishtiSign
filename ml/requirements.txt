@@ -6,8 +6,6 @@ numpy
 opencv-python
 torch
 mediapipe
-pygame
-PyOpenGL
 spacy
 # after installing, run: python -m spacy download en_core_web_sm
 requests
