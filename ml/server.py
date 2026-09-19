@@ -196,8 +196,17 @@ sign_sessions = {}
 WORD_MODEL_PATH  = os.path.join(BASE_DIR, "exported_model", "word_model.pth")
 WORD_LABELS_PATH = os.path.join(BASE_DIR, "exported_model", "word_labels.json")
 
-WORD_CONFIDENCE_MIN = 0.55   # below this we say nothing rather than guess
-WORD_STABLE_NEEDED  = 4      # consecutive agreeing predictions before committing
+WORD_CONFIDENCE_MIN  = 0.55   # below this we say nothing rather than guess
+WORD_STABLE_NEEDED   = 6      # consecutive agreeing predictions before committing
+WORD_COOLDOWN_FRAMES = 45     # frames of pause after a commit before the next
+                               # one can register. `buffer` is a SLIDING window,
+                               # so once full it predicts on every incoming frame -
+                               # without this, a real sign (which spans far more
+                               # than SEQ_LEN frames) refills the just-cleared
+                               # buffer while the user is still mid-gesture and
+                               # immediately commits the same word again. This
+                               # mirrors TEXT_COOLDOWN_FRAMES on the letter path,
+                               # which solves the identical problem there.
 
 word_model, word_labels = None, []
 try:
@@ -234,12 +243,17 @@ class WordSession:
         self.sentence = ""
         self.candidate = ""
         self.stable = 0
+        self.cooldown = 0
 
     def reset_after_commit(self):
         # Clear the window so the sign just committed can't immediately
-        # re-trigger from the frames still sitting in the buffer.
+        # re-trigger from the frames still sitting in the buffer, then hold
+        # off on the NEXT commit for a bit (see WORD_COOLDOWN_FRAMES) - the
+        # buffer alone isn't enough, since it refills from live video and the
+        # user is usually still mid-gesture right after a commit fires.
         self.buffer.clear()
         self.candidate, self.stable = "", 0
+        self.cooldown = WORD_COOLDOWN_FRAMES
 
 
 word_sessions = {}
@@ -545,13 +559,28 @@ def handle_word_frame(data):
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     res = detector.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)) if detector else None
 
+    # Cooldown counts down on every frame regardless of hand visibility, so a
+    # natural pause between signs (hand relaxing out of frame) elapses it just
+    # as well as continuing to hold a sign - it represents real elapsed time,
+    # not "frames where a hand happened to be visible".
+    if session.cooldown > 0:
+        session.cooldown -= 1
+
     if res and res.hand_landmarks:
         for lm in res.hand_landmarks:
             draw_landmarks(frame, lm)
-        # Both hands go into one feature vector (Left-then-Right, zero-filled
-        # if only one is present) - a two-handed sign's meaning is in how the
-        # hands relate to each other, not two independent classifications.
-        session.buffer.append(two_hand_features(res.hand_landmarks, res.handedness))
+
+        if session.cooldown == 0:
+            # Both hands go into one feature vector (Left-then-Right, zero-
+            # filled if only one is present) - a two-handed sign's meaning is
+            # in how the hands relate to each other, not two independent
+            # classifications.
+            session.buffer.append(two_hand_features(res.hand_landmarks, res.handedness))
+        # Buffer deliberately stays empty while cooldown > 0. If it kept
+        # accumulating, it would be full the instant cooldown ends, built from
+        # a stale mix of the sign just committed and whatever came right
+        # after - misclassifying the next word. Holding it empty guarantees
+        # the next prediction is built entirely from fresh frames.
     # A gap with no hand is meaningful - it separates one sign from the next -
     # so we simply stop feeding the buffer rather than clearing it outright.
 
