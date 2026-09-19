@@ -22,14 +22,16 @@ Pipeline:
       ▼
     sign queue: [{"label": "I", "kind": "letter", "word": "I"}, ...]
 
-The queue is what server.py feeds to HandAvatar3D.load_gesture() in
-sequence. Depends only on spaCy + (optionally) a local Ollama server —
+The queue is what the frontend (TextToSign.jsx) steps through to display each
+sign in turn. Depends only on spaCy + (optionally) a local Ollama server -
 no new ML model is trained here.
 """
 
 import os
 
 import spacy
+
+from word_sequences import VOCABULARY as WORD_MODEL_VOCABULARY
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -45,19 +47,33 @@ AUX_LEMMAS = {"be", "do", "have", "will", "shall", "would", "could"}
 # basic ASL gloss.
 DROP_WORDS = {"to"}
 
-# The 8 word signs we have real avatar pose data for (see
-# generate_word_poses.py), in their pose-file casing (Hello.json, etc).
-# Matched case-insensitively against the gloss.
-WORD_SIGN_LABELS = ["Bye", "Deaf", "Hello", "NotOk", "Pen", "Please", "Thankyou", "Yes"]
+# The whole-word signs we can display directly, sourced from the SAME
+# vocabulary the word-recognition model was trained on (word_sequences.py) -
+# not a separately hand-maintained list. This used to be a hardcoded 8-word
+# list left over from before the word model existed, which silently drifted
+# out of sync as that vocabulary was trimmed and expanded (35 -> 20 -> 34
+# words): words the model could recognize (e.g. "how", "family") were still
+# being fingerspelled here because this list never got updated to match.
+WORD_SIGN_LABELS = [w.capitalize() for w in WORD_MODEL_VOCABULARY]
 WORD_SIGNS_LOWER = {w.lower(): w for w in WORD_SIGN_LABELS}
+
+# English words that map to the SAME ASL sign as a vocabulary word, even
+# though they're not the same lemma (so spaCy's lemmatizer won't merge them).
+# Kept deliberately small and conservative - only pairs we're confident share
+# a sign, not general synonyms. e.g. "your"/"yours" are signed identically to
+# "you" (point at the listener); "my"/"mine" are NOT included here because in
+# real ASL they're a different handshape (a flat hand pressed to the chest,
+# not a pointing finger) - a wrong merge here would teach the wrong sign.
+WORD_ALIASES = {
+    "your": "you",
+    "yours": "you",
+}
 
 # Multi-word English phrases that map to ONE of our word signs (the sign
 # folders were named as single words, e.g. Thankyou/, but the phrase is two
 # words in English). Matched as adjacent lemma pairs before POS filtering.
 PHRASE_SIGNS = {
     ("thank", "you"): "Thankyou",
-    ("not", "ok"): "NotOk",
-    ("not", "okay"): "NotOk",
 }
 
 # Letters we have pose data for (A-Z). Fingerspelling skips anything else
@@ -160,15 +176,15 @@ def text_to_gloss(text):
 # ── Step 3: gloss -> sign queue (word sign or fingerspell) ─────
 def gloss_to_sign_queue(gloss_tokens):
     """
-    Turn gloss tokens into an ordered list of avatar-playable sign units:
-      {"label": <pose file name, no .json>, "kind": "word"|"letter", "word": <source token>}
+    Turn gloss tokens into an ordered list of sign units to display:
+      {"label": <sign name>, "kind": "word"|"letter", "word": <source token>}
     Tokens with no matching word sign and no fingerspellable letters are
     dropped (nothing to show, rather than guessing).
     """
     queue = []
 
     for token in gloss_tokens:
-        lower = token.lower()
+        lower = WORD_ALIASES.get(token.lower(), token.lower())
 
         if lower in WORD_SIGNS_LOWER:
             queue.append({"label": WORD_SIGNS_LOWER[lower], "kind": "word", "word": token})
