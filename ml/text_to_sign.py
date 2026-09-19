@@ -91,7 +91,10 @@ def simplify_with_llm(text, model="qwen3:8b", timeout=60):
 
     prompt = (
         "Rewrite the following sentence using short, simple, literal English. "
-        "Keep all the original meaning. Do not add commentary. "
+        "Keep all the original meaning and keep any greeting or courtesy phrases "
+        "EXACTLY as written - do not paraphrase 'thank you' as 'thanks', do not "
+        "shorten 'very much' to 'a lot', do not swap 'hello' for 'hi'. Only "
+        "simplify parts that are genuinely complex. Do not add commentary. "
         "Reply with ONLY the rewritten sentence, nothing else.\n\n"
         f"Sentence: {text}"
     )
@@ -178,6 +181,14 @@ def gloss_to_sign_queue(gloss_tokens):
     return queue
 
 
+# A short sentence has nothing for the LLM to usefully compress - it can only
+# introduce drift (e.g. rewriting "thank you very much" as "thanks a lot",
+# which breaks the literal phrase match in gloss_to_sign_queue). The LLM step
+# exists for genuinely long/complex input, so skip it below this length
+# regardless of the checkbox.
+LLM_MIN_WORDS = 10
+
+
 # ── Full pipeline ───────────────────────────────────────────────
 def translate(text, use_llm=False):
     """
@@ -185,7 +196,8 @@ def translate(text, use_llm=False):
       {"simplified": str, "gloss": [str], "queue": [sign unit dicts]}
     so the frontend can show what happened at each stage.
     """
-    simplified = simplify_with_llm(text) if use_llm else text
+    run_llm = use_llm and len(text.split()) >= LLM_MIN_WORDS
+    simplified = simplify_with_llm(text) if run_llm else text
     gloss = text_to_gloss(simplified)
     queue = gloss_to_sign_queue(gloss)
     return {"simplified": simplified, "gloss": gloss, "queue": queue}

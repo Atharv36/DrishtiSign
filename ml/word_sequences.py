@@ -23,8 +23,21 @@ import torch.nn as nn
 
 from feature_utils import extract_features, RICH_DIM
 
-SEQ_LEN = 32          # frames every clip is resampled to
-FEATURE_DIM = RICH_DIM  # 88 per frame
+SEQ_LEN = 32                    # frames every clip is resampled to
+HAND_FEATURE_DIM = RICH_DIM     # 88 per hand
+FEATURE_DIM = HAND_FEATURE_DIM * 2  # 176: both hands, left-then-right, zero-filled
+                                     # if a hand is absent - see two_hand_features().
+                                     #
+                                     # A single hand's classifier can only classify
+                                     # each hand independently (fine for letters,
+                                     # which are spelled one hand at a time). A
+                                     # two-handed WORD sign's meaning is in the
+                                     # RELATIONSHIP between both hands moving
+                                     # together, which needs both encoded into one
+                                     # feature per frame - not two separate
+                                     # classifications. One-handed signs still work
+                                     # fine this way: their second-hand slot is
+                                     # just zeros, which LayerNorm handles cleanly.
 
 # Everyday signs worth supporting. Kept small and frequent on purpose: a
 # compact reliable vocabulary beats a large flaky one, and any word outside it
@@ -32,28 +45,24 @@ FEATURE_DIM = RICH_DIM  # 88 per frame
 # out-of-vocabulary terms. Shared by the recorder and the trainer so the two
 # can't drift apart.
 #
-# Scoped to ONE-HANDED signs only - see audit_two_handed.py. Our extraction
-# reads a single hand (num_hands=1), so a genuinely two-handed sign (family,
-# help, learn, want, ...) loses exactly the information that disambiguates
-# it, which is why those words dominated the model's confusion pairs. Their
-# clip folders are still on disk (word_clips/) for when two-hand extraction
-# is added - see WORD_MODEL_ARCHITECTURE.md.
+# The two-handed words previously excluded here (audit_two_handed.py found
+# them under-served by a single-hand feature vector) are back in - see
+# two_hand_features() above. Extraction now captures both hands, ordered
+# Left-then-Right, so a genuinely bimanual sign is no longer missing half its
+# information.
 #
-# "good" is also excluded: it and "thankyou" are a well-known ASL beginner
+# "good" stays excluded: it and "thankyou" are a well-known ASL beginner
 # minimal pair (both a flat hand near the chin moving forward/down) and
 # consistently confused each other across every evaluation run - a genuine
-# sign-similarity collision, not a data artifact like the two-handed ones.
+# sign-similarity collision that adding a second hand's data doesn't fix.
 VOCABULARY = [
     "hello", "bye", "please", "thankyou", "sorry", "yes", "no",
     "need", "bad", "love", "eat", "drink", "water", "home", "work",
     "understand", "where", "who", "you", "me",
-]
-
-# Removed for reference - see comment above for why.
-EXCLUDED_TWO_HANDED = [
     "family", "friend", "go", "happy", "how", "learn", "more", "name",
     "sad", "want", "what", "help", "school", "stop",
 ]
+
 EXCLUDED_SIMILAR = ["good"]  # collides with "thankyou"
 
 
@@ -94,9 +103,32 @@ class WordSignGRU(nn.Module):
 
 
 def frame_features(hand_landmarks):
-    """One MediaPipe hand result -> (FEATURE_DIM,) feature vector."""
+    """One detected hand's 21 landmarks -> (HAND_FEATURE_DIM,) feature vector."""
     raw = [v for p in hand_landmarks for v in (p.x, p.y, p.z)]
     return np.array(extract_features(raw), dtype=np.float32)
+
+
+def two_hand_features(hand_landmarks_list, handedness_list):
+    """
+    Build one (FEATURE_DIM,) vector per frame from however many hands
+    MediaPipe detected (0, 1, or 2), ordered Left-then-Right so the model
+    always sees a consistent layout regardless of which hand happens to be
+    "hand_landmarks[0]" for that frame. A missing hand is zero-filled rather
+    than omitted, so the sequence length isn't affected by a hand briefly
+    leaving frame.
+    """
+    left = np.zeros(HAND_FEATURE_DIM, dtype=np.float32)
+    right = np.zeros(HAND_FEATURE_DIM, dtype=np.float32)
+    for lm, handed in zip(hand_landmarks_list, handedness_list):
+        if not handed:
+            continue
+        side = handed[0].category_name
+        feats = frame_features(lm)
+        if side == "Left":
+            left = feats
+        elif side == "Right":
+            right = feats
+    return np.concatenate([left, right])
 
 
 def resample(seq, n=SEQ_LEN):
@@ -125,7 +157,8 @@ def sequence_from_video(path, detector, min_frames=6, stride=1):
     too few frames contained a detectable hand.
 
     Works for your own recordings and for dataset clips (WLASL etc.) alike -
-    anything OpenCV can open.
+    anything OpenCV can open. `detector` should be configured with
+    num_hands=2 so two-handed signs are captured correctly.
     """
     import cv2
     import mediapipe as mp
@@ -146,7 +179,7 @@ def sequence_from_video(path, detector, min_frames=6, stride=1):
             except Exception:
                 res = None
             if res and res.hand_landmarks:
-                feats.append(frame_features(res.hand_landmarks[0]))
+                feats.append(two_hand_features(res.hand_landmarks, res.handedness))
         i += 1
     cap.release()
 

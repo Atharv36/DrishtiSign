@@ -14,7 +14,7 @@ from flask_cors import CORS
 from feature_utils import features_for_dim, BASIC_DIM
 from text_to_sign import translate as translate_text_to_sign
 from word_sequences import (SEQ_LEN, FEATURE_DIM, WordSignGRU,
-                            frame_features, resample)
+                            two_hand_features, resample)
 
 # Force an immediate exit on Ctrl+C / kill. Eventlet's greenlet scheduling can
 # swallow or delay the default signal handling, so an explicit os._exit() keeps
@@ -203,10 +203,17 @@ word_model, word_labels = None, []
 try:
     if os.path.exists(WORD_MODEL_PATH) and os.path.exists(WORD_LABELS_PATH):
         word_labels = json.load(open(WORD_LABELS_PATH))
-        word_model = WordSignGRU(len(word_labels))
-        word_model.load_state_dict(torch.load(WORD_MODEL_PATH, map_location='cpu'))
+        word_state = torch.load(WORD_MODEL_PATH, map_location='cpu')
+        # Auto-detect the feature dimension from the checkpoint (LayerNorm's
+        # weight length equals feature_dim exactly) rather than hardcoding it,
+        # so an older one-hand (88-dim) or newer two-hand (176-dim) checkpoint
+        # both load correctly without a code change - same pattern as the
+        # letter model's MODEL_IN_FEATURES detection above.
+        word_feature_dim = word_state['norm.weight'].shape[0]
+        word_model = WordSignGRU(len(word_labels), feature_dim=word_feature_dim)
+        word_model.load_state_dict(word_state)
         word_model.eval()
-        print(f"Loaded word model: {len(word_labels)} words.")
+        print(f"Loaded word model: {len(word_labels)} words, {word_feature_dim}-dim input.")
     else:
         print("No word model found - word mode disabled (train_word_model.py).")
 except Exception as e:
@@ -539,9 +546,12 @@ def handle_word_frame(data):
     res = detector.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)) if detector else None
 
     if res and res.hand_landmarks:
-        lm = res.hand_landmarks[0]
-        draw_landmarks(frame, lm)
-        session.buffer.append(frame_features(lm))
+        for lm in res.hand_landmarks:
+            draw_landmarks(frame, lm)
+        # Both hands go into one feature vector (Left-then-Right, zero-filled
+        # if only one is present) - a two-handed sign's meaning is in how the
+        # hands relate to each other, not two independent classifications.
+        session.buffer.append(two_hand_features(res.hand_landmarks, res.handedness))
     # A gap with no hand is meaningful - it separates one sign from the next -
     # so we simply stop feeding the buffer rather than clearing it outright.
 

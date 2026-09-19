@@ -93,7 +93,7 @@ def build_dataset():
         vision.HandLandmarkerOptions(
             base_options=mp_python.BaseOptions(model_asset_path=LANDMARKER),
             running_mode=vision.RunningMode.IMAGE,
-            num_hands=1,
+            num_hands=2,   # two-handed signs need both hands captured - see two_hand_features()
             min_hand_detection_confidence=0.4,
         )
     )
