@@ -158,7 +158,9 @@ class HandState:
 LETTER_SET = set(labels) - {"del", "nothing", "space"}
 
 TEXT_HOLD_FRAMES_NEED = 14   # frames a stable letter must hold before it's committed
-TEXT_COOLDOWN_FRAMES  = 12   # frames of "no sign / different sign" before the same letter can repeat
+TEXT_COOLDOWN_FRAMES  = 24   # frames of mandatory pause after a commit, giving the user
+                              # time to move their hand into the next letter's shape before
+                              # anything gets classified again
 
 class TextSession:
     def __init__(self):
@@ -179,6 +181,17 @@ class TextSession:
         confs = [x[1] for x in self.hist if x[0] == best]
         self.label = best
         self.conf  = sum(confs) / len(confs)
+
+    def start_cooldown(self, frames):
+        # Clear the smoothing window, not just stop feeding it - hist is a
+        # majority-vote deque, so leaving old votes in it means the letter
+        # just committed can still win the vote for several frames after
+        # cooldown ends, even though nothing new has been fed in since.
+        self.hist.clear()
+        self.label, self.conf = "", 0.0
+        self.hold_counter = 0
+        self.last_label = ""
+        self.cooldown = frames
 
 # Per-connection state, keyed by socket id, so concurrent users don't
 # share a sentence buffer.
@@ -465,14 +478,26 @@ def handle_text_frame(data):
 
     res = detector.detect(mp_img) if detector else None
 
+    # Cooldown counts down on every frame, unconditionally - it's meant to be
+    # a real, predictable pause after each letter so the user has time to
+    # physically move their hand into the next letter's shape, not something
+    # a noisy transitional reading can cancel early.
+    if session.cooldown > 0:
+        session.cooldown -= 1
+
     detected = False
     if res and res.hand_landmarks:
         lm = res.hand_landmarks[0]
         draw_landmarks(frame, lm)
-        raw         = [v for p in lm for v in (p.x, p.y, p.z)]
-        label, conf = predict(raw)
-        session.update(label, conf)
-        detected = True
+        if session.cooldown == 0:
+            # Don't feed the smoothing window (session.hist) while cooling
+            # down either - otherwise it fills with the hand mid-transition,
+            # and the read right as cooldown clears is a stale mix rather
+            # than a fresh look at whatever the user has settled into.
+            raw         = [v for p in lm for v in (p.x, p.y, p.z)]
+            label, conf = predict(raw)
+            session.update(label, conf)
+            detected = True
 
     if not detected:
         session.label, session.conf = "", 0.0
@@ -483,10 +508,7 @@ def handle_text_frame(data):
     # then a cooldown gap is required before the same letter can repeat
     # (so one held sign doesn't spam the same letter over and over).
     if session.cooldown > 0:
-        session.cooldown -= 1
         session.hold_counter = 0
-        if current != session.last_label:
-            session.cooldown = 0
     elif current and current in LETTER_SET:
         if current == session.last_label:
             session.hold_counter += 1
@@ -496,8 +518,7 @@ def handle_text_frame(data):
 
         if session.hold_counter >= TEXT_HOLD_FRAMES_NEED:
             session.sentence += current
-            session.hold_counter = 0
-            session.cooldown     = TEXT_COOLDOWN_FRAMES
+            session.start_cooldown(TEXT_COOLDOWN_FRAMES)
     else:
         session.hold_counter = 0
         session.last_label   = ""
