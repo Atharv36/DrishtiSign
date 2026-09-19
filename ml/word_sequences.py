@@ -31,13 +31,30 @@ FEATURE_DIM = RICH_DIM  # 88 per frame
 # still works via fingerspelling - which is what real signers do for names and
 # out-of-vocabulary terms. Shared by the recorder and the trainer so the two
 # can't drift apart.
+#
+# Scoped to ONE-HANDED signs only - see audit_two_handed.py. Our extraction
+# reads a single hand (num_hands=1), so a genuinely two-handed sign (family,
+# help, learn, want, ...) loses exactly the information that disambiguates
+# it, which is why those words dominated the model's confusion pairs. Their
+# clip folders are still on disk (word_clips/) for when two-hand extraction
+# is added - see WORD_MODEL_ARCHITECTURE.md.
+#
+# "good" is also excluded: it and "thankyou" are a well-known ASL beginner
+# minimal pair (both a flat hand near the chin moving forward/down) and
+# consistently confused each other across every evaluation run - a genuine
+# sign-similarity collision, not a data artifact like the two-handed ones.
 VOCABULARY = [
     "hello", "bye", "please", "thankyou", "sorry", "yes", "no",
-    "help", "want", "need", "good", "bad", "love", "friend", "family",
-    "eat", "drink", "water", "home", "work", "school", "learn",
-    "understand", "what", "where", "who", "how", "more", "stop", "go",
-    "happy", "sad", "name", "you", "me",
+    "need", "bad", "love", "eat", "drink", "water", "home", "work",
+    "understand", "where", "who", "you", "me",
 ]
+
+# Removed for reference - see comment above for why.
+EXCLUDED_TWO_HANDED = [
+    "family", "friend", "go", "happy", "how", "learn", "more", "name",
+    "sad", "want", "what", "help", "school", "stop",
+]
+EXCLUDED_SIMILAR = ["good"]  # collides with "thankyou"
 
 
 class WordSignGRU(nn.Module):

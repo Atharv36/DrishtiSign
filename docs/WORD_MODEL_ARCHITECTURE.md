@@ -90,6 +90,52 @@ beats a large flaky one. Starting list (~35):
 > love, friend, family, eat, drink, water, home, work, school, learn,
 > understand, what, where, who, how, more, stop, go, happy, sad, name, you, me
 
+### 3a. Vocabulary trim: 35 → 20 (evidence-based, not guessed)
+
+The 35-word model scored 71.4% ± 4.7% (5-fold). Two problems in that set were
+diagnosed and fixed rather than guessed at:
+
+**Two-handed signs lose information with `num_hands=1` extraction.** A
+genuinely bimanual sign only has its dominant hand captured — exactly the
+information that would disambiguate it is thrown away. This was verified
+against OUR OWN clips, not assumed from memory of ASL: `audit_two_handed.py`
+runs `num_hands=2` detection over each word's clips and measures how often two
+hands are detected clearly separated (≥0.15 normalized distance) in the same
+frame.
+
+```bash
+python audit_two_handed.py     # writes exported_model/two_hand_audit.json
+```
+
+Confirmed two-handed (≥30% of frames): `family, friend, go, happy, how,
+learn, more, name, sad, want, what`. Also excluded as borderline (25–29%,
+real ASL confirms these are two-handed — ​the low measured ratio is likely
+clip framing/occlusion): `help, school, stop`.
+
+Cross-referencing against the confusion pairs from every evaluation run
+showed **most recurring confusions were exactly these two-handed words**
+(`how↔help`, `want↔family`, `sad↔family/learn`, `go↔drink`, `what↔good/work`)
+— strong evidence the confusion was information loss, not the model being
+weak. Their clip folders stay on disk for when two-hand extraction is added
+(§4, two-handed note).
+
+**One genuine sign-similarity collision remained after that:** `good` ↔
+`thankyou` recurred in every run and both are, in real ASL, a flat hand near
+the chin moving forward/down — a well-documented beginner minimal pair, not a
+data artifact. `good` was dropped, keeping `thankyou`.
+
+**Result: 20 words, all confirmed one-handed, 85.1% ± 5.6% (5-fold, 17×
+chance)** — up from 71.4% ± 4.7% on the full 35. `word_sequences.py` keeps the
+excluded lists (`EXCLUDED_TWO_HANDED`, `EXCLUDED_SIMILAR`) so the reasoning
+travels with the code.
+
+**Reference check:** a similar public project
+([Sign-Language-To-Text-Conversion](https://github.com/emnikhil/Sign-Language-To-Text-Conversion))
+independently documents confusable *letter* clusters (D/R/U, T/K/D/I, S/M/N)
+from the same kind of single-hand landmark approach — external confirmation
+that landmark-based confusability is a real, expected phenomenon worth
+auditing for, not specific to this project.
+
 ---
 
 ## 4. Preprocessing: clip → fixed-size tensor
@@ -111,15 +157,22 @@ Two deliberate choices:
 
 Cache the extracted array (`.npz`) so retraining doesn't re-decode every video.
 
-### ⚠️ Two-handed signs — decide this early
+### ⚠️ Two-handed signs — decided for v1, revisit later
 
 Many ASL word signs use **both hands**, but the current extraction is
-`num_hands=1`. Options:
+`num_hands=1`. **v1 ships option A** (below) and scopes the vocabulary to
+one-handed signs only (§3a) rather than accepting degraded accuracy on
+two-handed ones. `EXCLUDED_TWO_HANDED` in `word_sequences.py` lists 14 words
+ready to reintroduce once option B lands - their clip folders are still on
+disk in `word_clips/`.
 
-- **A (simple):** dominant hand only — 88 features/frame. Loses two-handed
-  distinctions but is a fine v1.
-- **B (correct):** both hands — 176 features/frame, zero-filled when the second
-  hand is absent, with a consistent left/right ordering.
+- **A (shipped):** dominant hand only — 88 features/frame. Loses two-handed
+  signs entirely, but what it does recognize, it recognizes reliably
+  (§3a: dropping them raised accuracy 71.4% → 85.1%).
+- **B (upgrade path):** both hands — 176 features/frame, zero-filled when the
+  second hand is absent, with a consistent left/right ordering. Re-run
+  `audit_two_handed.py` afterward to confirm accuracy on the reintroduced
+  words before trusting them live.
 
 Recommend starting with **A**, designing the feature function so B is a drop-in
 change.
