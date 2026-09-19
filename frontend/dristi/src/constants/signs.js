@@ -24,6 +24,20 @@ export const SIGN_IMAGES = { A: signA, B: signB, C: signC, D: signD };
 // always matches what the model was trained on. After retraining with the word
 // dataset, the new words (Hello, Thankyou, ...) show up here automatically —
 // no frontend change needed. Falls back to SIGNS if the server is unreachable.
+// The word model's vocabulary (motion signs). Separate from the letter list
+// because they're separate models - see /word-labels on the ML server.
+export async function fetchWordSigns() {
+  try {
+    const res = await fetch('http://localhost:5002/word-labels');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const labels = await res.json();
+    return Array.isArray(labels) ? labels : [];
+  } catch (err) {
+    console.warn('Could not load word labels from ML server:', err.message);
+    return [];
+  }
+}
+
 export async function fetchSigns() {
   try {
     const res = await fetch('http://localhost:5002/labels');

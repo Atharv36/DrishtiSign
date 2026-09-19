@@ -272,6 +272,12 @@ init_globals()
 def index():
     return "DrishtiSign ML Web Socket Server is running."
 
+@app.route('/word-labels')
+def get_word_labels():
+    """The word model's vocabulary, so Learning/Practice can offer a word mode
+    without hard-coding a list that could drift from the trained model."""
+    return jsonify(word_labels)
+
 @app.route('/labels')
 def get_labels():
     """The model's real vocabulary, so the frontend never hard-codes a sign

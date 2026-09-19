@@ -1,6 +1,6 @@
 import React, { useRef, useState, useEffect } from 'react';
 import { io } from 'socket.io-client';
-import { SIGNS as FALLBACK_SIGNS, SIGN_IMAGES, fetchSigns } from '../constants/signs';
+import { SIGNS as FALLBACK_SIGNS, SIGN_IMAGES, fetchSigns, fetchWordSigns } from '../constants/signs';
 
 const SUCCESS_POPUP_MS = 5000;
 
@@ -21,9 +21,14 @@ export default function SignLearningMode({ close }) {
   const [detectedLabel, setDetectedLabel] = useState("");
   const [accuracy, setAccuracy] = useState(0);
 
-  // Flashcard vocabulary comes from the model's real labels (see fetchSigns);
-  // starts with the fallback list so the first render is instant.
-  const [flashcards, setFlashcards] = useState(FALLBACK_SIGNS);
+  // Letters and words are taught by two different models - a letter is a
+  // handshape, a word sign is a movement - so the learner picks which one
+  // they're practising rather than the app guessing.
+  const [mode, setMode] = useState('letters');
+  const [letterSigns, setLetterSigns] = useState(FALLBACK_SIGNS);
+  const [wordSigns, setWordSigns] = useState([]);
+
+  const flashcards = mode === 'words' ? wordSigns : letterSigns;
 
   // Sequential flashcard progression (Duolingo-style: one lesson after another)
   const [cardIndex, setCardIndex] = useState(0);
@@ -31,8 +36,12 @@ export default function SignLearningMode({ close }) {
   const [showSuccess, setShowSuccess] = useState(false);
 
   useEffect(() => {
-    fetchSigns().then(setFlashcards);
+    fetchSigns().then(setLetterSigns);
+    fetchWordSigns().then(setWordSigns);
   }, []);
+
+  const modeRef = useRef(mode);   // read by the frame loop without resubscribing
+  useEffect(() => { modeRef.current = mode; }, [mode]);
 
   const socketRef = useRef(null);
   const isProcessingRef = useRef(false); // Prevent frame queue buildup
@@ -52,11 +61,26 @@ export default function SignLearningMode({ close }) {
     advanceLockRef.current = false;
     setShowSuccess(false);
     resetDetectionState();
-    setCardIndex(((index % flashcards.length) + flashcards.length) % flashcards.length);
+    setCardIndex(flashcards.length
+      ? ((index % flashcards.length) + flashcards.length) % flashcards.length
+      : 0);
   };
 
   const nextCard = () => goToCard(cardIndex + 1);
   const prevCard = () => goToCard(cardIndex - 1);
+
+  const switchMode = (next) => {
+    if (next === mode) return;
+    if (successTimerRef.current) {
+      clearTimeout(successTimerRef.current);
+      successTimerRef.current = null;
+    }
+    advanceLockRef.current = false;
+    setShowSuccess(false);
+    resetDetectionState();
+    setMode(next);
+    setCardIndex(0);
+  };
 
   // Check if the user is currently signing the active flashcard correctly
   const isCorrect = detectedLabel === targetSign && accuracy > MATCH_CONFIDENCE;
@@ -105,6 +129,14 @@ export default function SignLearningMode({ close }) {
       isProcessingRef.current = false;
     });
 
+    // Word mode is served by the temporal model on a different event.
+    socketRef.current.on('word_processed_frame', (data) => {
+      if (data.image !== undefined) setProcessedImage(data.image);
+      if (data.label !== undefined) setDetectedLabel(data.label);
+      if (data.confidence !== undefined) setAccuracy(data.confidence);
+      isProcessingRef.current = false;
+    });
+
     return () => {
         socketRef.current.disconnect();
         stopCamera();
@@ -142,7 +174,9 @@ export default function SignLearningMode({ close }) {
                 // Convert to compressed jpeg (60% quality is fine for MediaPipe)
                 const base64Data = canvas.toDataURL('image/jpeg', 0.6);
                 // Send to server
-                socketRef.current.emit('video_frame', base64Data);
+                socketRef.current.emit(
+                    modeRef.current === 'words' ? 'word_frame' : 'video_frame',
+                    base64Data);
             } else {
                 isProcessingRef.current = false;
             }
@@ -196,9 +230,30 @@ export default function SignLearningMode({ close }) {
 
         {/* Header */}
         <div className="flex justify-between items-center mb-4">
-            <h2 className="text-2xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-emerald-400 to-emerald-600">
-                Sign Learning
-            </h2>
+            <div className="flex items-center gap-4">
+                <h2 className="text-2xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-emerald-400 to-emerald-600">
+                    Sign Learning
+                </h2>
+
+                {/* Letters and words are taught by different models, so the
+                    learner picks which they're practising. */}
+                <div className="flex bg-gray-100 dark:bg-gray-800 rounded-xl p-1 gap-1">
+                    {[['letters', 'Letters'], ['words', 'Words']].map(([key, text]) => (
+                        <button
+                            key={key}
+                            onClick={() => switchMode(key)}
+                            disabled={key === 'words' && wordSigns.length === 0}
+                            className={`px-3 py-1.5 rounded-lg text-sm font-semibold transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
+                                mode === key
+                                    ? 'bg-white dark:bg-[#0f172a] text-emerald-600 dark:text-emerald-400 shadow-sm'
+                                    : 'text-gray-500 hover:text-gray-700 dark:hover:text-gray-300'
+                            }`}
+                        >
+                            {text}
+                        </button>
+                    ))}
+                </div>
+            </div>
             <button onClick={close} className="text-gray-500 hover:text-red-500 transition-colors p-2 rounded-full hover:bg-gray-100 dark:hover:bg-gray-800">
                 <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
