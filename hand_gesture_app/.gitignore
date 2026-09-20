@@ -1,0 +1,9 @@
+venv_mp/
+venv311/
+dataset/
+dataset_old/
+dataset_frames/
+__pycache__/
+*.pth
+*.png
+sentence_output.txt
