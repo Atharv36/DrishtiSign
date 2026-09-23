@@ -1,5 +1,6 @@
 import { Link, useNavigate } from 'react-router-dom';
 import ThemeToggle from './ThemeToggle';
+import LanguageSelect from './LanguageSelect';
 
 const Navbar = () => {
   const navigate = useNavigate();
@@ -11,12 +12,16 @@ const Navbar = () => {
   };
 
   return (
-    <nav className="flex items-center justify-between p-4 bg-background border-b border-black/10 dark:border-white/10">
-      <Link to="/" className="text-2xl font-bold text-accent tracking-wider">
+    <nav className="grid grid-cols-3 items-center p-4 bg-background border-b border-black/10 dark:border-white/10">
+      <Link to="/" className="text-2xl font-bold text-accent tracking-wider justify-self-start">
         DrishtiSign
       </Link>
-      
-      <div className="flex items-center gap-4">
+
+      <div className="justify-self-center">
+        <LanguageSelect />
+      </div>
+
+      <div className="flex items-center gap-4 justify-self-end">
         {userInfo ? (
           <>
             <Link to="/dashboard" className="font-medium hover:text-accent font-semibold transition-colors">

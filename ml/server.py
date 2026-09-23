@@ -12,7 +12,9 @@ from flask_socketio import SocketIO, emit
 from flask_cors import CORS
 
 from feature_utils import features_for_dim, BASIC_DIM
+from letter_model import GestureClassifier
 from text_to_sign import translate as translate_text_to_sign
+from isl_text_to_sign import translate as translate_text_to_isl
 from word_sequences import (SEQ_LEN, FEATURE_DIM, WordSignGRU,
                             two_hand_features, resample)
 
@@ -34,83 +36,81 @@ signal.signal(signal.SIGTERM, _force_exit)
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH  = os.path.join(BASE_DIR, "exported_model", "gesture_recognizer.pth")
 LABELS_PATH = os.path.join(BASE_DIR, "exported_model", "labels.json")
+ISL_MODEL_PATH  = os.path.join(BASE_DIR, "exported_model", "isl_model.pth")
+ISL_LABELS_PATH = os.path.join(BASE_DIR, "exported_model", "isl_labels.json")
 LANDMARKER  = os.path.join(BASE_DIR, "hand_landmarker.task")
 
 CONFIDENCE_MIN = 0.6
 SMOOTH_FRAMES  = 15
 
-try:
-    labels = json.load(open(LABELS_PATH))
-except FileNotFoundError:
-    print(f"Error: Could not find labels file at {LABELS_PATH}")
-    labels = []
-
-# ── MODEL ─────────────────────────────────────────────────────
-class GestureClassifier(nn.Module):
-    def __init__(self, num_classes: int, in_features: int):
-        super().__init__()
-
-        # Feature extractor
-        self.features = nn.Sequential(
-            nn.Linear(in_features, 512),
-            nn.BatchNorm1d(512),
-            nn.ReLU(),
-            nn.Dropout(0.4),
-
-            nn.Linear(512, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-
-            nn.Linear(256, 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-        )
-
-        # Skip connection projection (in_features -> 128)
-        self.skip = nn.Linear(in_features, 128)
-
-        # Classifier head
-        self.classifier = nn.Sequential(
-            nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, num_classes),
-        )
-
-    def forward(self, x):
-        features = self.features(x)
-        skip     = self.skip(x)          # residual shortcut
-        out      = features + skip       # merge
-        return self.classifier(out)
+# ── LETTER MODELS (one per sign language) ─────────────────────
+# ASL and ISL are the SAME problem - a static handshape classified from one
+# frame - so they are the same architecture over the same 88-dim features, and
+# differ only in weights and label set. Keeping them in one registry means the
+# inference path, the hold-to-commit logic and the socket payloads are shared
+# rather than duplicated per language.
+#
+# Input size is read off each checkpoint so a 63-dim model and an 88-dim one
+# both load without a code change here.
+DEFAULT_LANG = 'asl'
+LETTER_MODELS = {}
 
 
-# Auto-detect the model's expected input size from the checkpoint so an old
-# 63-dim model and a new rich model both load without any code change here.
-MODEL_IN_FEATURES = BASIC_DIM
-model = None
-if os.path.exists(MODEL_PATH):
-    state = torch.load(MODEL_PATH, map_location='cpu')
-    MODEL_IN_FEATURES = state['features.0.weight'].shape[1]
-    model = GestureClassifier(len(labels), MODEL_IN_FEATURES)
-    model.load_state_dict(state)
-    model.eval()
-    print(f"Loaded model: {len(labels)} classes, {MODEL_IN_FEATURES}-dim input.")
-else:
-    print(f"Warning: model file not found at {MODEL_PATH}")
+def _load_letter_model(lang, model_path, labels_path):
+    """Load one language's letter model, or skip it. A missing model must
+    degrade to 'that language is unavailable', never take the server down -
+    the same contract the word model already has."""
+    try:
+        lang_labels = json.load(open(labels_path))
+        state = torch.load(model_path, map_location='cpu')
+        in_features = state['features.0.weight'].shape[1]
+        net = GestureClassifier(len(lang_labels), in_features)
+        net.load_state_dict(state)
+        net.eval()
+        LETTER_MODELS[lang] = {'model': net, 'labels': lang_labels,
+                               'in_features': in_features}
+        print(f"Loaded {lang.upper()} letter model: {len(lang_labels)} classes, "
+              f"{in_features}-dim input.")
+    except FileNotFoundError:
+        print(f"Note: no {lang.upper()} letter model at {model_path} - "
+              f"that language will be unavailable.")
+    except Exception as e:
+        print(f"Failed to load {lang.upper()} letter model:", e)
+
+
+_load_letter_model('asl', MODEL_PATH, LABELS_PATH)
+_load_letter_model('isl', ISL_MODEL_PATH, ISL_LABELS_PATH)
+
+# Which language each connected client is signing in. Set by the 'set_language'
+# event; anything not explicitly set stays on the default.
+session_lang = {}
+
+
+def lang_for(sid):
+    """The session's language, falling back to the default if its model is
+    missing - better to keep reading ASL than to return Unknown forever."""
+    lang = session_lang.get(sid, DEFAULT_LANG)
+    return lang if lang in LETTER_MODELS else DEFAULT_LANG
+
+
+def labels_for(lang):
+    entry = LETTER_MODELS.get(lang)
+    return entry['labels'] if entry else []
+
 
 # ── PREDICT ───────────────────────────────────────────────────
-def predict(raw):
-    if model is None or len(labels) == 0:
+def predict(raw, lang=DEFAULT_LANG):
+    entry = LETTER_MODELS.get(lang)
+    if entry is None:
         return "Unknown", 0.0
     # Use whichever feature representation matches the loaded model.
-    feats = features_for_dim(raw, MODEL_IN_FEATURES)
+    feats = features_for_dim(raw, entry['in_features'])
     x = torch.tensor(feats, dtype=torch.float32).unsqueeze(0)
     with torch.no_grad():
-        probs = torch.softmax(model(x), dim=1)
+        probs = torch.softmax(entry['model'](x), dim=1)
         conf, idx = probs.max(dim=1)
-    return labels[idx.item()], conf.item()
+    return entry['labels'][idx.item()], conf.item()
+
 
 # ── DRAW 2D SKELETON ON CAMERA FEED ──────────────────────────
 CONNECTION_COLORS = {
@@ -155,7 +155,9 @@ class HandState:
 # Word breaks and corrections are driven by the keyboard (space /
 # backspace) rather than the "space"/"del" gesture classes, so only
 # actual letters get auto-committed here.
-LETTER_SET = set(labels) - {"del", "nothing", "space"}
+def letter_set_for(lang):
+    """Labels that may auto-commit while fingerspelling, for one language."""
+    return set(labels_for(lang)) - {"del", "nothing", "space"}
 
 TEXT_HOLD_FRAMES_NEED = 14   # frames a stable letter must hold before it's committed
 TEXT_COOLDOWN_FRAMES  = 24   # frames of mandatory pause after a commit, giving the user
@@ -309,14 +311,20 @@ def index():
 @app.route('/word-labels')
 def get_word_labels():
     """The word model's vocabulary, so Learning/Practice can offer a word mode
-    without hard-coding a list that could drift from the trained model."""
+    without hard-coding a list that could drift from the trained model.
+
+    Only ASL has a word model. Returning an empty list for any other language
+    is what makes the frontend's existing "disable Words when the list is
+    empty" behaviour do the right thing, with no language-specific UI logic."""
+    if request.args.get('lang', DEFAULT_LANG) != DEFAULT_LANG:
+        return jsonify([])
     return jsonify(word_labels)
 
 @app.route('/labels')
 def get_labels():
-    """The model's real vocabulary, so the frontend never hard-codes a sign
-    list that can drift out of sync with what the model was trained on."""
-    return jsonify(labels)
+    """The selected language's real vocabulary, so the frontend never
+    hard-codes a sign list that can drift out of sync with the trained model."""
+    return jsonify(labels_for(request.args.get('lang', DEFAULT_LANG)))
 
 @socketio.on('connect')
 def test_connect():
@@ -329,9 +337,25 @@ def test_connect():
         h.hist.clear()
         h.label, h.conf = "", 0.0
 
+@socketio.on('set_language')
+def handle_set_language(data):
+    """Pick which letter model reads this client's frames.
+
+    Resets the fingerspelling session too: a sentence half-built out of ASL
+    letters is meaningless once the alphabet changes under it, and the rolling
+    vote would otherwise carry stale labels from the old label space."""
+    lang = (data or {}).get('lang', DEFAULT_LANG)
+    if lang not in LETTER_MODELS:
+        emit('language_set', {'lang': lang_for(request.sid), 'available': False})
+        return
+    session_lang[request.sid] = lang
+    text_sessions.pop(request.sid, None)
+    emit('language_set', {'lang': lang, 'available': True})
+
 @socketio.on('disconnect')
 def test_disconnect():
     print('Client disconnected')
+    session_lang.pop(request.sid, None)
     text_sessions.pop(request.sid, None)
     word_sessions.pop(request.sid, None)
     session = sign_sessions.pop(request.sid, None)
@@ -377,7 +401,7 @@ def handle_video_frame(data):
             draw_landmarks(frame, lm)
 
             raw         = [v for p in lm for v in (p.x, p.y, p.z)]
-            label, conf = predict(raw)
+            label, conf = predict(raw, lang_for(request.sid))
 
             if handedness == "Left":
                 hands[0].update(label, conf)
@@ -495,7 +519,7 @@ def handle_text_frame(data):
             # and the read right as cooldown clears is a stale mix rather
             # than a fresh look at whatever the user has settled into.
             raw         = [v for p in lm for v in (p.x, p.y, p.z)]
-            label, conf = predict(raw)
+            label, conf = predict(raw, lang_for(request.sid))
             session.update(label, conf)
             detected = True
 
@@ -509,7 +533,7 @@ def handle_text_frame(data):
     # (so one held sign doesn't spam the same letter over and over).
     if session.cooldown > 0:
         session.hold_counter = 0
-    elif current and current in LETTER_SET:
+    elif current and current in letter_set_for(lang_for(request.sid)):
         if current == session.last_label:
             session.hold_counter += 1
         else:
@@ -517,7 +541,14 @@ def handle_text_frame(data):
             session.last_label = current
 
         if session.hold_counter >= TEXT_HOLD_FRAMES_NEED:
-            session.sentence += current
+            # Single characters run together the way spelling should ("C","A","T"
+            # -> "CAT"). Multi-character labels - ISL consonants like KHA, and
+            # ASL's whole-word classes - need separating, or the sentence comes
+            # out as one unreadable run of letters.
+            if len(current) == 1:
+                session.sentence += current
+            else:
+                session.sentence += (" " if session.sentence else "") + current
             session.start_cooldown(TEXT_COOLDOWN_FRAMES)
     else:
         session.hold_counter = 0
@@ -549,7 +580,16 @@ def handle_text_key(data):
     if action == 'space':
         session.sentence += ' '
     elif action == 'backspace':
-        session.sentence = session.sentence[:-1]
+        # Backspace undoes the last COMMIT, and what a commit appended depends
+        # on the alphabet. ASL letters are single characters concatenated into
+        # words, so one character is one sign. ISL consonants are multi-
+        # character labels written space-separated, so deleting a character
+        # would leave a fragment ("KHA MA HA" -> "KHA MA H") that is not a sign
+        # at all - the whole token has to go.
+        if lang_for(sid) == DEFAULT_LANG:
+            session.sentence = session.sentence[:-1]
+        else:
+            session.sentence = session.sentence.rstrip().rpartition(' ')[0]
     elif action == 'clear':
         session.sentence = ''
 
@@ -682,7 +722,20 @@ def handle_translate_text(data):
         emit('sign_translate_error', {'message': 'That sentence is too long — please shorten it.'})
         return
 
-    result = translate_text_to_sign(text, use_llm=use_llm)
+    # ASL gets the gloss pipeline (articles dropped, verbs lemmatized - ASL
+    # gloss is a grammar). ISL gets transliteration: the sign set is consonants
+    # only, so text is fingerspelled sound by sound. Different operations, not
+    # two configurations of one.
+    lang = (data or {}).get('lang', DEFAULT_LANG)
+    try:
+        if lang == 'isl':
+            result = translate_text_to_isl(text)
+        else:
+            result = translate_text_to_sign(text, use_llm=use_llm)
+    except FileNotFoundError as e:
+        emit('sign_translate_error', {'message': str(e)})
+        return
+    result['lang'] = lang
     queue = result['queue'][:MAX_SIGN_QUEUE]
 
     if not queue:
@@ -700,6 +753,7 @@ def handle_translate_text(data):
         'simplified': result['simplified'],
         'gloss': result['gloss'],
         'queue': queue,
+        'lang': lang,
     })
 
 

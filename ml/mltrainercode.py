@@ -19,7 +19,8 @@ from mediapipe.tasks.python import vision
 
 import kagglehub
 
-from feature_utils import extract_features, RICH_DIM
+from feature_utils import extract_features, augment_landmarks, RICH_DIM
+from letter_model import GestureClassifier
 
 print("⏳ Downloading/Locating Kaggle Dataset automatically...")
 base_path = kagglehub.dataset_download("grassknoted/asl-alphabet")
@@ -82,45 +83,6 @@ LANDMARKER_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "han
 base_options = mp_python.BaseOptions(model_asset_path=LANDMARKER_MODEL)
 options      = vision.HandLandmarkerOptions(base_options=base_options, num_hands=1)
 detector     = vision.HandLandmarker.create_from_options(options)
-
-
-def _rotation_matrix(ax, ay, az):
-    """Compose a 3D rotation from small pitch/yaw/roll angles (radians)."""
-    cx, sx = np.cos(ax), np.sin(ax)
-    cy, sy = np.cos(ay), np.sin(ay)
-    cz, sz = np.cos(az), np.sin(az)
-    Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
-    Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
-    Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
-    return Rz @ Ry @ Rx
-
-
-def augment_landmarks(raw: list) -> list:
-    """
-    Randomly perturb a raw hand pose so the model sees the kind of variation a
-    real webcam produces — the training images are unnaturally clean, which is
-    why detection "works sometimes" live. Applied only to the training set.
-
-      • small 3D rotation  → hand tilted at different angles
-      • horizontal mirror  → left/right hand + the mirrored webcam feed
-      • scale jitter       → hand nearer/further from the camera
-      • gaussian noise     → MediaPipe landmark jitter
-    """
-    pts = np.array(raw, dtype=np.float64).reshape(21, 3)
-    pts = pts - pts[0]                       # rotate/mirror about the wrist
-
-    ax = np.random.uniform(-0.17, 0.17)      # ≈ ±10° pitch
-    ay = np.random.uniform(-0.17, 0.17)      # ≈ ±10° yaw
-    az = np.random.uniform(-0.35, 0.35)      # ≈ ±20° in-plane roll
-    pts = pts @ _rotation_matrix(ax, ay, az).T
-
-    if np.random.rand() < 0.5:               # mirror handedness / feed flip
-        pts[:, 0] = -pts[:, 0]
-
-    pts *= np.random.uniform(0.9, 1.1)       # scale jitter
-    pts += np.random.normal(0, 0.01, pts.shape)  # landmark noise
-
-    return pts.flatten().tolist()
 
 
 def extract_landmarks(image_path: str):
@@ -221,48 +183,9 @@ _weights = [n_train / (len(labels) * _counts.get(c, 1)) for c in range(len(label
 class_weights = torch.tensor(_weights, dtype=torch.float32)
 
 
-# ── 5. Improved Model ─────────────────────────────────────────
-# Deeper network with residual-style skip connection
-# Much better at distinguishing similar signs (A vs S vs T etc.)
-class GestureClassifier(nn.Module):
-    def __init__(self, num_classes: int):
-        super().__init__()
-
-        # Feature extractor
-        self.features = nn.Sequential(
-            nn.Linear(RICH_DIM, 512),
-            nn.BatchNorm1d(512),
-            nn.ReLU(),
-            nn.Dropout(0.4),
-
-            nn.Linear(512, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-
-            nn.Linear(256, 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-        )
-
-        # Skip connection projection (RICH_DIM -> 128)
-        self.skip = nn.Linear(RICH_DIM, 128)
-
-        # Classifier head
-        self.classifier = nn.Sequential(
-            nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, num_classes),
-        )
-
-    def forward(self, x):
-        features = self.features(x)
-        skip     = self.skip(x)          # residual shortcut
-        out      = features + skip       # merge
-        return self.classifier(out)
-
+# ── 5. Model ─────────────────────────────────────────────────
+# Architecture lives in letter_model.py so the trainer and the inference
+# server can never drift apart - see that module's docstring.
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model  = GestureClassifier(num_classes=len(labels)).to(device)

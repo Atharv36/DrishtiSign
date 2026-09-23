@@ -1,14 +1,10 @@
 import React, { useRef, useState, useEffect } from 'react';
 import { io } from 'socket.io-client';
-import { SIGNS as FALLBACK_SIGNS, SIGN_IMAGES, fetchSigns, fetchWordSigns } from '../constants/signs';
+import { SIGNS as FALLBACK_SIGNS, signMedia, fetchSigns, fetchWordSigns } from '../constants/signs';
+import { getLanguage, languageLabel } from '../constants/language';
 
 const SUCCESS_POPUP_MS = 5000;
 
-// The ML server already smooths predictions (15-frame majority vote) and only
-// emits a label once its confidence clears 0.6, so anything we receive is
-// already a confident, stable reading. Gating again at 0.6 here would sit right
-// on that boundary and flicker, so we accept a confidently-detected matching
-// letter at a lower bar to make passing reliable.
 const MATCH_CONFIDENCE = 0.5;
 
 export default function SignLearningMode({ close }) {
@@ -21,11 +17,9 @@ export default function SignLearningMode({ close }) {
   const [detectedLabel, setDetectedLabel] = useState("");
   const [accuracy, setAccuracy] = useState(0);
 
-  // Letters and words are taught by two different models - a letter is a
-  // handshape, a word sign is a movement - so the learner picks which one
-  // they're practising rather than the app guessing.
   const [mode, setMode] = useState('letters');
-  const [letterSigns, setLetterSigns] = useState(FALLBACK_SIGNS);
+  const [lang] = useState(getLanguage);
+  const [letterSigns, setLetterSigns] = useState(lang === 'asl' ? FALLBACK_SIGNS : []);
   const [wordSigns, setWordSigns] = useState([]);
 
   const flashcards = mode === 'words' ? wordSigns : letterSigns;
@@ -36,8 +30,8 @@ export default function SignLearningMode({ close }) {
   const [showSuccess, setShowSuccess] = useState(false);
 
   useEffect(() => {
-    fetchSigns().then(setLetterSigns);
-    fetchWordSigns().then(setWordSigns);
+    fetchSigns(lang).then(setLetterSigns);
+    fetchWordSigns(lang).then(setWordSigns);
   }, []);
 
   const modeRef = useRef(mode);   // read by the frame loop without resubscribing
@@ -112,6 +106,8 @@ export default function SignLearningMode({ close }) {
 
     socketRef.current.on('connect', () => {
       console.log('Connected to ML Server');
+      // Tell the server which letter model should read this session's frames.
+      socketRef.current.emit('set_language', { lang });
     });
 
     socketRef.current.on('processed_frame', (data) => {
@@ -222,7 +218,7 @@ export default function SignLearningMode({ close }) {
     resetDetectionState();
   };
 
-  const demoImage = SIGN_IMAGES[targetSign];
+  const demoMedia = signMedia(lang)[targetSign];
 
   return (
     <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4 animate-in fade-in duration-300">
@@ -234,6 +230,10 @@ export default function SignLearningMode({ close }) {
                 <h2 className="text-2xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-emerald-400 to-emerald-600">
                     Sign Learning
                 </h2>
+
+                <span className="px-2 py-1 rounded-lg text-xs font-bold bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20">
+                    {languageLabel(lang)}
+                </span>
 
                 {/* Letters and words are taught by different models, so the
                     learner picks which they're practising. */}
@@ -316,9 +316,21 @@ export default function SignLearningMode({ close }) {
             <div className={`flex-1 rounded-2xl p-6 flex flex-col items-center justify-center text-center transition-colors duration-500 border shadow-sm ${isCorrect ? 'bg-emerald-50 dark:bg-emerald-900/20 border-emerald-500' : 'bg-gray-50 dark:bg-gray-800/50 border-gray-200 dark:border-gray-800'}`}>
                 <h3 className="text-gray-500 dark:text-gray-400 font-medium tracking-wide text-sm uppercase mb-2">Do this sign</h3>
 
-                {demoImage ? (
+                {demoMedia ? (
                     <div className="relative my-3">
-                        <img src={demoImage} alt={`How to sign ${targetSign}`} className="w-40 h-40 object-cover rounded-2xl border-4 border-white dark:border-gray-900 shadow-lg" />
+                        {demoMedia.type === 'video' ? (
+                            <video
+                                key={targetSign}
+                                src={demoMedia.src}
+                                autoPlay
+                                muted
+                                loop
+                                playsInline
+                                className="w-40 h-40 object-cover rounded-2xl border-4 border-white dark:border-gray-900 shadow-lg"
+                            />
+                        ) : (
+                            <img src={demoMedia.src} alt={`How to sign ${targetSign}`} className="w-40 h-40 object-cover rounded-2xl border-4 border-white dark:border-gray-900 shadow-lg" />
+                        )}
                         <p className="mt-2 text-2xl font-black text-gray-900 dark:text-white">{targetSign}</p>
                     </div>
                 ) : (

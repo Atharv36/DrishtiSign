@@ -1,5 +1,12 @@
 @import "tailwindcss";
 
+/* Tailwind v4 defaults dark: to prefers-color-scheme (OS setting). This app
+   toggles a .dark class on <html> instead (ThemeToggle.jsx), so without this,
+   every dark: utility ignores the in-app toggle and just follows the OS
+   theme - only the CSS custom properties below (--bg-color etc.) were
+   actually responding to it. */
+@custom-variant dark (&:where(.dark, .dark *));
+
 @theme {
   --color-background: var(--bg-color);
   --color-accent: var(--accent-color);

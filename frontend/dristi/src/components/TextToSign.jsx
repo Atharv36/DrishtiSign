@@ -1,13 +1,14 @@
 import React, { useRef, useState, useEffect } from 'react';
 import { io } from 'socket.io-client';
-import { SIGN_IMAGES } from '../constants/signs';
+import { signMedia } from '../constants/signs';
+import { getLanguage, languageLabel } from '../constants/language';
 
-// How long each sign is shown. Kept here (not on the server) because playback
-// is now entirely client-side - the server only does the language work.
-const SIGN_HOLD_MS = 1300;
+const LETTER_HOLD_MS = 1300;
+const WORD_HOLD_MS = 2200;
 
 export default function TextToSign({ close }) {
   const [text, setText] = useState('');
+  const [lang] = useState(getLanguage);
   const [useLLM, setUseLLM] = useState(false);
 
   const [queue, setQueue] = useState([]);
@@ -43,39 +44,36 @@ export default function TextToSign({ close }) {
 
     return () => {
       socketRef.current.disconnect();
-      if (timerRef.current) clearInterval(timerRef.current);
+      if (timerRef.current) clearTimeout(timerRef.current);
     };
   }, []);
 
-  // Client-side playback: step through the queue on a timer. Nothing is
-  // streamed from the server, so this keeps working even if the ML server is
-  // busy, and it needs no rendering backend at all.
   useEffect(() => {
-    if (!isPlaying || queue.length === 0) return undefined;
+    if (!isPlaying || queue.length === 0 || index < 0) return undefined;
 
-    timerRef.current = setInterval(() => {
+    const holdMs = queue[index]?.kind === 'word' ? WORD_HOLD_MS : LETTER_HOLD_MS;
+    timerRef.current = setTimeout(() => {
       setIndex((i) => {
         if (i + 1 >= queue.length) {
-          clearInterval(timerRef.current);
           setIsPlaying(false);
           return i;
         }
         return i + 1;
       });
-    }, SIGN_HOLD_MS);
+    }, holdMs);
 
-    return () => clearInterval(timerRef.current);
-  }, [isPlaying, queue]);
+    return () => clearTimeout(timerRef.current);
+  }, [isPlaying, queue, index]);
 
   const handleTranslate = () => {
     const trimmed = text.trim();
     if (!trimmed) return;
-    if (timerRef.current) clearInterval(timerRef.current);
+    if (timerRef.current) clearTimeout(timerRef.current);
     setError('');
     setIndex(-1);
     setIsPlaying(false);
     setIsSimplifying(useLLM);
-    socketRef.current.emit('translate_text', { text: trimmed, useLLM });
+    socketRef.current.emit('translate_text', { text: trimmed, useLLM, lang });
   };
 
   const handleReplay = () => {
@@ -85,21 +83,27 @@ export default function TextToSign({ close }) {
   };
 
   const handleStop = () => {
-    if (timerRef.current) clearInterval(timerRef.current);
+    if (timerRef.current) clearTimeout(timerRef.current);
     setIsPlaying(false);
   };
 
   const current = index >= 0 && index < queue.length ? queue[index] : null;
-  const currentImage = current ? SIGN_IMAGES[current.label] : null;
+  const currentMedia = current ? signMedia(lang)[current.label] : null;
 
   return (
     <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4 animate-in fade-in duration-300">
       <div className="bg-white dark:bg-[#0f172a] border border-gray-200 dark:border-gray-800 p-6 rounded-3xl w-full max-w-5xl shadow-2xl overflow-hidden relative flex flex-col transition-colors">
 
         <div className="flex justify-between items-center mb-4">
+            <div className="flex items-center gap-3">
             <h2 className="text-2xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-teal-400 to-cyan-600">
                 Text to Sign
             </h2>
+
+            <span className="px-2 py-1 rounded-lg text-xs font-bold bg-teal-500/10 text-teal-600 dark:text-teal-300 border border-teal-500/20">
+                {languageLabel(lang)}
+            </span>
+            </div>
             <button onClick={close} className="text-gray-500 hover:text-red-500 transition-colors p-2 rounded-full hover:bg-gray-100 dark:hover:bg-gray-800">
                 <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
@@ -113,12 +117,24 @@ export default function TextToSign({ close }) {
           <div className="md:col-span-7 bg-gray-50 dark:bg-gray-900 rounded-2xl overflow-hidden border border-gray-200 dark:border-gray-800 relative h-full flex flex-col items-center justify-center">
             {current ? (
                 <>
-                    {currentImage ? (
-                        <img
-                            src={currentImage}
-                            alt={`Sign for ${current.word}`}
-                            className="max-h-[75%] max-w-[80%] object-contain rounded-2xl shadow-lg"
-                        />
+                    {currentMedia ? (
+                        currentMedia.type === 'video' ? (
+                            <video
+                                key={current.label}
+                                src={currentMedia.src}
+                                autoPlay
+                                muted
+                                loop
+                                playsInline
+                                className="max-h-[75%] max-w-[80%] object-contain rounded-2xl shadow-lg"
+                            />
+                        ) : (
+                            <img
+                                src={currentMedia.src}
+                                alt={`Sign for ${current.word}`}
+                                className="max-h-[75%] max-w-[80%] object-contain rounded-2xl shadow-lg"
+                            />
+                        )
                     ) : (
                         // No reference image for this sign yet - show the letter
                         // or word itself rather than nothing.
@@ -171,14 +187,18 @@ export default function TextToSign({ close }) {
                 <textarea
                     value={text}
                     onChange={(e) => setText(e.target.value)}
-                    placeholder="Type something to sign..."
+                    placeholder={lang === 'isl' ? 'Type a word to fingerspell...' : 'Type something to sign...'}
                     rows={4}
                     className="w-full bg-gray-50 dark:bg-gray-800/50 rounded-xl border border-gray-200 dark:border-gray-800 p-3 text-[var(--text-color)] placeholder-gray-400 resize-none focus:outline-none focus:ring-2 focus:ring-teal-400/50"
                 />
-                <label className="flex items-center gap-2 mt-2 text-xs text-gray-500 dark:text-gray-400 cursor-pointer">
-                    <input type="checkbox" checked={useLLM} onChange={(e) => setUseLLM(e.target.checked)} className="accent-teal-500" />
-                    Simplify with AI first (slower, ~15-20s, for long sentences)
-                </label>
+                {/* The LLM pre-pass rewrites English for ASL gloss conversion.
+                    ISL here is transliteration, so there's nothing for it to do. */}
+                {/* {lang !== 'isl' && (
+                    <label className="flex items-center gap-2 mt-2 text-xs text-gray-500 dark:text-gray-400 cursor-pointer">
+                        <input type="checkbox" checked={useLLM} onChange={(e) => setUseLLM(e.target.checked)} className="accent-teal-500" />
+                        Simplify with AI first (slower, ~15-20s, for long sentences)
+                    </label>
+                )} */}
             </div>
 
             <button
@@ -220,6 +240,12 @@ export default function TextToSign({ close }) {
                         </div>
                     )}
                     <h4 className="text-xs font-medium text-gray-500 uppercase tracking-widest mb-2">Signs to perform</h4>
+                    {lang === 'isl' && (
+                        <p className="text-xs text-gray-400 mb-2 leading-relaxed">
+                            Fingerspelled sound by sound, not translated into ISL grammar.
+                            The sign set is consonants only, so vowels are dropped.
+                        </p>
+                    )}
                     <div className="flex flex-wrap gap-1.5">
                         {gloss.map((word, i) => (
                             <span key={i} className="px-2.5 py-1 rounded-lg text-xs font-semibold bg-teal-500/10 text-teal-600 dark:text-teal-300 border border-teal-500/20">

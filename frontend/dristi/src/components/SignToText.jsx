@@ -1,16 +1,17 @@
 import React, { useRef, useState, useEffect } from 'react';
 import { io } from 'socket.io-client';
+import { fetchWordSigns } from '../constants/signs';
+import { getLanguage, languageLabel } from '../constants/language';
 
 export default function SignToText({ close }) {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
   const [isActive, setIsActive] = useState(false);
 
-  // 'letters' uses the single-frame letter model (fingerspelling);
-  // 'words' uses the temporal word model. They're genuinely different models -
-  // a letter is a handshape, a word sign is a movement - so the mode is chosen
-  // explicitly rather than guessed at.
   const [mode, setMode] = useState('letters');
+
+  const [lang] = useState(getLanguage);
+  const [wordsAvailable, setWordsAvailable] = useState(false);
 
   const [processedImage, setProcessedImage] = useState(null);
   const [detectedLabel, setDetectedLabel] = useState("");
@@ -27,10 +28,16 @@ export default function SignToText({ close }) {
   useEffect(() => { modeRef.current = mode; }, [mode]);
 
   useEffect(() => {
+    fetchWordSigns(lang).then((words) => setWordsAvailable(words.length > 0));
+  }, [lang]);
+
+  useEffect(() => {
     socketRef.current = io('http://localhost:5002');
 
     socketRef.current.on('connect', () => {
       console.log('Connected to ML Server');
+      // Tell the server which letter model should read this session's frames.
+      socketRef.current.emit('set_language', { lang });
     });
 
     socketRef.current.on('text_processed_frame', (data) => {
@@ -70,8 +77,6 @@ export default function SignToText({ close }) {
     isProcessingRef.current = false;
   };
 
-  // Space / Backspace drive word breaks and corrections directly,
-  // instead of relying on the "space"/"del" gesture classes.
   useEffect(() => {
     const handleKeyDown = (e) => {
       const event = modeRef.current === 'words' ? 'word_key' : 'text_key';
@@ -176,6 +181,10 @@ export default function SignToText({ close }) {
                     Sign to Text
                 </h2>
 
+                <span className="px-2 py-1 rounded-lg text-xs font-bold bg-indigo-500/10 text-indigo-600 dark:text-indigo-400 border border-indigo-500/20">
+                    {languageLabel(lang)}
+                </span>
+
                 {/* Which model reads the camera. Letters and words are separate
                     models, so this picks one rather than guessing. */}
                 <div className="flex bg-gray-100 dark:bg-gray-800 rounded-xl p-1 gap-1">
@@ -183,7 +192,11 @@ export default function SignToText({ close }) {
                         <button
                             key={key}
                             onClick={() => switchMode(key)}
-                            className={`px-3 py-1.5 rounded-lg text-sm font-semibold transition-colors ${
+                            disabled={key === 'words' && !wordsAvailable}
+                            title={key === 'words' && !wordsAvailable
+                                ? 'Word signs are only available in ASL'
+                                : undefined}
+                            className={`px-3 py-1.5 rounded-lg text-sm font-semibold transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
                                 mode === key
                                     ? 'bg-white dark:bg-[#0f172a] text-indigo-500 shadow-sm'
                                     : 'text-gray-500 hover:text-gray-700 dark:hover:text-gray-300'

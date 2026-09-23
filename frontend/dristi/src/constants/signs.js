@@ -1,34 +1,56 @@
-import signA from '../static/A.jpg';
-import signB from '../static/B.jpg';
-import signC from '../static/C.jpg';
-import signD from '../static/D.jpg';
+import { DEFAULT_LANGUAGE } from './language';
 
-// Labels we never want to show as practice targets:
-//  - del / nothing / space are meta classes, not real signs.
-//  - J and Z are motion-based letters (they trace a shape in the air) that a
-//    single-frame landmark classifier can't do reliably.
+const ML_SERVER = 'http://localhost:5002';
+
+
 const EXCLUDED_LABELS = new Set(['del', 'nothing', 'space', 'J', 'Z']);
 
-// Fallback list used before /labels loads (or if the ML server is offline).
-// Matches the current alphabet model: A-Z minus the excluded letters.
+
 export const SIGNS = [
   "A", "B", "C", "D", "E", "F", "G", "H", "I", "K", "L", "M",
   "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y",
 ];
 
-// Reference photos we currently have in src/static. Signs without a photo
-// fall back to the big text glyph in Learning mode.
-export const SIGN_IMAGES = { A: signA, B: signB, C: signC, D: signD };
 
-// Pull the model's actual vocabulary from the ML server so the practice list
-// always matches what the model was trained on. After retraining with the word
-// dataset, the new words (Hello, Thankyou, ...) show up here automatically —
-// no frontend change needed. Falls back to SIGNS if the server is unreachable.
-// The word model's vocabulary (motion signs). Separate from the letter list
-// because they're separate models - see /word-labels on the ML server.
-export async function fetchWordSigns() {
+const aslLetterModules = import.meta.glob('../static/static_letters/*.png', { eager: true });
+const ASL_LETTER_MEDIA = Object.fromEntries(
+  Object.entries(aslLetterModules).map(([path, mod]) => [
+    path.split('/').pop().replace('.png', ''),
+    { src: mod.default, type: 'image' },
+  ])
+);
+
+const aslWordModules = import.meta.glob('../static/WORDS/*.mp4', { eager: true });
+const ASL_WORD_MEDIA = {};
+for (const [path, mod] of Object.entries(aslWordModules)) {
+  const stem = path.split('/').pop().replace(/0+\.mp4$/i, '').trim().replace(/\s+/g, '').toLowerCase();
+  const media = { src: mod.default, type: 'video' };
+
+  ASL_WORD_MEDIA[stem] = media;
+  ASL_WORD_MEDIA[stem.charAt(0).toUpperCase() + stem.slice(1)] = media;
+}
+
+const ASL_MEDIA = { ...ASL_LETTER_MEDIA, ...ASL_WORD_MEDIA };
+
+const islImageModules = import.meta.glob('../static/isl/*.jpg', { eager: true });
+const ISL_MEDIA = Object.fromEntries(
+  Object.entries(islImageModules).map(([path, mod]) => [
+    path.split('/').pop().replace('.jpg', ''),
+    { src: mod.default, type: 'image' },
+  ])
+);
+
+export const SIGN_IMAGES = Object.fromEntries(
+  Object.entries(ASL_LETTER_MEDIA).map(([label, media]) => [label, media.src])
+);
+
+export function signMedia(lang = DEFAULT_LANGUAGE) {
+  return lang === 'isl' ? ISL_MEDIA : ASL_MEDIA;
+}
+
+export async function fetchWordSigns(lang = DEFAULT_LANGUAGE) {
   try {
-    const res = await fetch('http://localhost:5002/word-labels');
+    const res = await fetch(`${ML_SERVER}/word-labels?lang=${lang}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const labels = await res.json();
     return Array.isArray(labels) ? labels : [];
@@ -38,15 +60,15 @@ export async function fetchWordSigns() {
   }
 }
 
-export async function fetchSigns() {
+export async function fetchSigns(lang = DEFAULT_LANGUAGE) {
   try {
-    const res = await fetch('http://localhost:5002/labels');
+    const res = await fetch(`${ML_SERVER}/labels?lang=${lang}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const labels = await res.json();
     const usable = labels.filter((l) => !EXCLUDED_LABELS.has(l));
-    return usable.length ? usable : SIGNS;
+    if (usable.length) return usable;
   } catch (err) {
-    console.warn('Could not load labels from ML server, using fallback list:', err.message);
-    return SIGNS;
+    console.warn('Could not load labels from ML server:', err.message);
   }
+  return lang === DEFAULT_LANGUAGE ? SIGNS : [];
 }

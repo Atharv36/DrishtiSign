@@ -87,3 +87,4 @@ build/
 word_clips/
 wlasl_samples.json
 word_sequences_cache.npz
+isl_landmarks_cache.npz

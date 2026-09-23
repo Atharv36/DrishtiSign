@@ -51,15 +51,7 @@ const Dashboard = () => {
         </div>
 
         {/* 3 Explicit Feature Modules Grid */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">{/* Activity Calendar */}
-        <div className="mt-8">
-            <h2 className="text-2xl font-bold mb-4 text-[var(--text-color)]">Your Activity</h2>
-            <div className="max-w-md">
-                <ActivityCalendar />
-            </div>
-        </div>
-
-            {/* 1. Sign Learning (Flashcard Mode) ACTIVE */}
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">{/* 1. Sign Learning (Flashcard Mode) ACTIVE */}
             <div className="col-span-1 lg:col-span-3 group relative">
                 <div className="bg-white dark:bg-[#0f172a] border border-[var(--accent-color)] rounded-3xl p-8 sm:p-10 shadow-xl relative overflow-hidden flex flex-col md:flex-row justify-between items-center gap-8">
                     
@@ -163,6 +155,14 @@ const Dashboard = () => {
                     </div>
 
                  </div>
+            </div>
+
+            {/* Activity Calendar */}
+            <div className="col-span-1 lg:col-span-3">
+                <h2 className="text-2xl font-bold mb-4 text-[var(--text-color)]">Your Activity</h2>
+                <div className="max-w-md">
+                    <ActivityCalendar />
+                </div>
             </div>
 
         </div>

@@ -1,12 +1,11 @@
 import React, { useRef, useState, useEffect } from 'react';
 import { io } from 'socket.io-client';
 import { SIGNS as FALLBACK_SIGNS, fetchSigns, fetchWordSigns } from '../constants/signs';
+import { getLanguage, languageLabel } from '../constants/language';
 
 const SUCCESS_POPUP_MS = 5000;
 const ROUND_TIME_MS = 20000; // Hidden window - no visible countdown by design.
 
-// See SignLearningMode: the server already gates on confidence, so we accept a
-// confidently-detected matching letter at a lower bar to make passing reliable.
 const MATCH_CONFIDENCE = 0.5;
 
 const randomIndexExcluding = (list, exclude) => {
@@ -25,22 +24,23 @@ export default function SignPracticeMode({ close }) {
   const [detectedLabel, setDetectedLabel] = useState("");
   const [accuracy, setAccuracy] = useState(0);
 
-  // Letters and words are quizzed by two different models - a letter is a
-  // handshape, a word sign is a movement - so the mode is explicit.
   const [mode, setMode] = useState('letters');
-  const [letterSigns, setLetterSigns] = useState(FALLBACK_SIGNS);
+  const [lang] = useState(getLanguage);
+  const [letterSigns, setLetterSigns] = useState(lang === 'asl' ? FALLBACK_SIGNS : []);
   const [wordSigns, setWordSigns] = useState([]);
 
   const flashcards = mode === 'words' ? wordSigns : letterSigns;
 
-  // Quiz state - randomized order, no demo image (this is recall practice, not a lesson)
-  const [cardIndex, setCardIndex] = useState(() => Math.floor(Math.random() * FALLBACK_SIGNS.length));
+  const [cardIndex, setCardIndex] = useState(0);
   const targetSign = flashcards[cardIndex] || flashcards[0];
   const [showSuccess, setShowSuccess] = useState(false);
 
   useEffect(() => {
-    fetchSigns().then(setLetterSigns);
-    fetchWordSigns().then(setWordSigns);
+    fetchSigns(lang).then((signs) => {
+      setLetterSigns(signs);
+      setCardIndex(signs.length ? Math.floor(Math.random() * signs.length) : 0);
+    });
+    fetchWordSigns(lang).then(setWordSigns);
   }, []);
 
   const socketRef = useRef(null);
@@ -106,8 +106,6 @@ export default function SignPracticeMode({ close }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isCorrect]);
 
-  // Hidden 20s window per sign: if the camera is running and time runs out
-  // without a correct match, silently move on - no popup, no message.
   useEffect(() => {
     if (!isActive || showSuccess) return undefined;
 
@@ -138,6 +136,8 @@ export default function SignPracticeMode({ close }) {
 
     socketRef.current.on('connect', () => {
       console.log('Connected to ML Server');
+      // Tell the server which letter model should read this session's frames.
+      socketRef.current.emit('set_language', { lang });
     });
 
     socketRef.current.on('processed_frame', (data) => {
@@ -247,6 +247,10 @@ export default function SignPracticeMode({ close }) {
                 <h2 className="text-2xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-amber-400 to-orange-600">
                     Sign Practice
                 </h2>
+
+                <span className="px-2 py-1 rounded-lg text-xs font-bold bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20">
+                    {languageLabel(lang)}
+                </span>
 
                 {/* Letters and words are quizzed by different models. */}
                 <div className="flex bg-gray-100 dark:bg-gray-800 rounded-xl p-1 gap-1">

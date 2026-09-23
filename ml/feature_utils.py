@@ -88,3 +88,47 @@ RICH_DIM = len(extract_features([0.0] * 63))
 def features_for_dim(raw, in_features):
     """Pick the representation matching a model's expected input size."""
     return extract_features(raw) if in_features == RICH_DIM else normalize_flat(raw)
+
+
+# ── Training-time augmentation ────────────────────────────────
+# Lives here (rather than in one trainer) so every letter-model trainer
+# augments identically - the ASL trainer and the ISL trainer must not teach
+# the model two different ideas of what "the same pose, slightly moved" means.
+
+def _rotation_matrix(ax, ay, az):
+    """Compose a 3D rotation from small pitch/yaw/roll angles (radians)."""
+    cx, sx = np.cos(ax), np.sin(ax)
+    cy, sy = np.cos(ay), np.sin(ay)
+    cz, sz = np.cos(az), np.sin(az)
+    Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
+    Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+    Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
+    return Rz @ Ry @ Rx
+
+
+def augment_landmarks(raw):
+    """
+    Randomly perturb a raw hand pose so the model sees the kind of variation a
+    real webcam produces - training images are unnaturally clean, which is why
+    an un-augmented model "works sometimes" live. Training set only.
+
+      • small 3D rotation  -> hand tilted at different angles
+      • horizontal mirror  -> left/right hand + the mirrored webcam feed
+      • scale jitter       -> hand nearer/further from the camera
+      • gaussian noise     -> MediaPipe landmark jitter
+    """
+    pts = np.array(raw, dtype=np.float64).reshape(21, 3)
+    pts = pts - pts[0]                       # rotate/mirror about the wrist
+
+    ax = np.random.uniform(-0.17, 0.17)      # ≈ ±10° pitch
+    ay = np.random.uniform(-0.17, 0.17)      # ≈ ±10° yaw
+    az = np.random.uniform(-0.35, 0.35)      # ≈ ±20° in-plane roll
+    pts = pts @ _rotation_matrix(ax, ay, az).T
+
+    if np.random.rand() < 0.5:               # mirror handedness / feed flip
+        pts[:, 0] = -pts[:, 0]
+
+    pts *= np.random.uniform(0.9, 1.1)       # scale jitter
+    pts += np.random.normal(0, 0.01, pts.shape)  # landmark noise
+
+    return pts.flatten().tolist()
